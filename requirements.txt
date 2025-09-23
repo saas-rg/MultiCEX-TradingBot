@@ -1,0 +1,16 @@
+# --- Core ---
+requests>=2.31.0
+python-dotenv>=1.0.1
+
+# --- Gate.io SDK (опционально, если USE_SDK=True в config.py) ---
+gate-api>=6.104.0
+
+# --- Web API ---
+fastapi>=0.111.0
+uvicorn>=0.30.0
+
+# --- Database (Heroku Postgres) ---
+psycopg2-binary>=2.9.9
+
+# --- Data validation ---
+pydantic>=2.8.2

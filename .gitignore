@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+.venv/
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+
+# Secrets & local configs
+.env
+*.local.json
+
+# App data & outputs
+logs/
+data/
+*.sqlite
+*.db
+*.csv
+
+# Node (на будущее)
+node_modules/

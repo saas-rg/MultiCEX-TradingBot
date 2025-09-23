@@ -1,0 +1,4 @@
+name=ref-2025-09-19-v0.7.0
+version=0.7.0
+date=2025-09-19
+notes=reports: BUY negative, NET (Σquote−Σfee_usdt) in CSV+text; startup heartbeat; same columns, extra TOTAL row
