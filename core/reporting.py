@@ -177,6 +177,7 @@ def _collect_trades_for_pairs(pairs: List[Dict[str, Any]], buy_win: Tuple[int,in
     rows: List[Dict[str, Any]] = []
     for p in pairs:
         pair = p["pair"]
+        exch = p.get("exchange", "gate")  # v0.7.2: биржа пары (по умолчанию gate)
         base_sym = pair.split("_", 1)[0] if "_" in pair else pair
         # BUY
         for tr in _fetch_trades_gate(pair, buy_win[0], buy_win[1]):
@@ -186,6 +187,7 @@ def _collect_trades_for_pairs(pairs: List[Dict[str, Any]], buy_win: Tuple[int,in
             rows.append({
                 "ts": ts,
                 "ts_iso": datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+                "exchange": exch,                 # <-- добавлено
                 "pair": pair,
                 "base": base_sym,
                 "side": "BUY",
@@ -203,6 +205,7 @@ def _collect_trades_for_pairs(pairs: List[Dict[str, Any]], buy_win: Tuple[int,in
             rows.append({
                 "ts": ts,
                 "ts_iso": datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+                "exchange": exch,                 # <-- добавлено
                 "pair": pair,
                 "base": base_sym,
                 "side": "SELL",
@@ -271,8 +274,10 @@ def build_report_text(period_min: int, ref_end_ts: int) -> str:
     # Итог NET (USDT) — дублирует CSV
     lines.append(f"<b>Итог NET (USDT):</b> {fmt(net, 6)}")
     for p in pairs:
+        exch = p.get("exchange", "gate")  # v0.7.2: показываем биржу в телеметрии
         lines.append(
-            "• <code>{pair}</code> dev={dev}% {mode}/{gs}% {lot_or_quote} {en}".format(
+            "• [{ex}:{pair}] dev={dev}% {mode}/{gs}% {lot_or_quote} {en}".format(
+                ex=exch,
                 pair=p["pair"],
                 dev=fmt(p["deviation_pct"], 3),
                 mode=p["gap_mode"],
@@ -296,7 +301,8 @@ def build_report_csv(period_min: int, ref_end_ts: int) -> bytes:
 
     buf = io.StringIO()
     wr = csv.writer(buf)
-    wr.writerow(["ts","ts_iso","pair","side","price","amount","quote_value","fee","fee_currency","trade_id"])
+    # v0.7.2: добавили колонку exchange (третьей)
+    wr.writerow(["ts","ts_iso","exchange","pair","side","price","amount","quote_value","fee","fee_currency","trade_id"])
 
     for r in rows:
         price  = Decimal(str(r["price"]))
@@ -310,20 +316,20 @@ def build_report_csv(period_min: int, ref_end_ts: int) -> bytes:
         if side == "BUY":
             qv = -qv
 
-        # fee в USDT
+        # fee в USDT (накапливаем для NET)
         fee_usdt = _fee_to_usdt(side, base, fee, str(r.get("fee_currency","")), price)
 
         total_quote += qv
         total_fee_usdt += fee_usdt
 
         wr.writerow([
-            r["ts"], r["ts_iso"], r["pair"], side,
+            r["ts"], r["ts_iso"], r.get("exchange","gate"), r["pair"], side,
             str(price), str(amount), str(qv),
             str(fee), r.get("fee_currency",""), r["id"]
         ])
 
     net = total_quote - total_fee_usdt
-    # Итоговая строка (строго та же схема колонок)
+    # Итоговая строка (оставляем формат как был; без "exchange")
     wr.writerow([
         "TOTAL", "", "ALL", "NET",
         "", "", str(net),
