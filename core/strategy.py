@@ -5,6 +5,7 @@ import threading
 import concurrent.futures
 import time
 import traceback
+import logging  # <-- добавлено ранее
 
 from config import (
     API_KEY, API_SECRET, TESTNET, HOST, ACCOUNT_TYPE,
@@ -16,7 +17,10 @@ from core.state import set_last_order_id, get_last_order_id
 from core.params import list_pairs, get_paused
 from core.reporting import tick as reporting_tick
 from core.heartbeat import tick as heartbeat_tick, init as heartbeat_init
-from exchanges.gate import (
+from core.telemetry import send_event  # <-- добавлено ранее
+
+# ⬇️ ЗАМЕНА: теперь все вызовы биржи идут через прокси-слой
+from core.exchange_proxy import (
     get_pair_rules, get_last_price, get_prev_minute_close,
     place_limit_buy, cancel_order, get_available, cancel_all_open_orders
 )
@@ -24,6 +28,14 @@ from exchanges.gate import (
 _pair_rules_lock = threading.Lock()
 _pair_rules: dict[str, tuple[int, int, Decimal, Decimal]] = {}
 FEE_BUFFER = Decimal("0.9985")
+
+log = logging.getLogger(__name__)  # <-- добавлено ранее
+
+# --- антиспам автоуведомлений автоснижения BUY ---
+AUTO_RESIZE_COOLDOWN_SEC = 5 * 60  # 5 минут
+_auto_resize_last_ts: dict[str, float] = {}  # pair -> last send ts (epoch seconds)
+_auto_resize_lock = threading.Lock()         # потокобезопасность
+
 
 def _compute_base_and_target(pair: str, gap_mode: str, gap_switch_pct: Decimal, deviation_pct: Decimal) -> Tuple[Decimal, Decimal, Decimal, str]:
     prev_close = get_prev_minute_close(pair)
@@ -49,6 +61,7 @@ def _compute_base_and_target(pair: str, gap_mode: str, gap_switch_pct: Decimal, 
     target_price = base_price * (Decimal(1) - deviation_pct / Decimal(100))
     return base_price, target_price, gap_pct, src
 
+
 def _ensure_pair_rules(pair: str):
     with _pair_rules_lock:
         if pair in _pair_rules:
@@ -57,6 +70,7 @@ def _ensure_pair_rules(pair: str):
     with _pair_rules_lock:
         _pair_rules[pair] = rules
     return rules
+
 
 def _prepare_and_place(cfg: dict):
     pair = cfg["pair"]
@@ -96,6 +110,7 @@ def _prepare_and_place(cfg: dict):
         return {"pair": pair, "ok": False, "error": f"get_available({quote_sym}) error: {e}"}
 
     try:
+        # --- расчёт исходного объёма ---
         if cfg["lot_size_base"] > 0:
             amount_base = dquant(cfg["lot_size_base"], aprec)
             order_quote_value = (amount_base * target_price).quantize(Decimal("1e-18"), rounding=ROUND_DOWN)
@@ -105,11 +120,16 @@ def _prepare_and_place(cfg: dict):
             amount_base = dquant(raw_amount, aprec)
             order_quote_value = (amount_base * target_price).quantize(Decimal("1e-18"), rounding=ROUND_DOWN)
 
+        # запомним исходный запрос до автокоррекции (для телеметрии)
+        requested_amount_base = amount_base
+
+        # --- автокоррекция по доступному балансу ---
         max_affordable_quote = (avail_quote * FEE_BUFFER).quantize(Decimal("1e-18"), rounding=ROUND_DOWN)
         if order_quote_value > max_affordable_quote and target_price > 0:
             amount_base = dquant((max_affordable_quote / target_price).quantize(Decimal("1e-18"), rounding=ROUND_DOWN), aprec)
             order_quote_value = (amount_base * target_price).quantize(Decimal("1e-18"), rounding=ROUND_DOWN)
 
+        # --- проверка минимумов биржи (quote/base) ---
         if min_quote and order_quote_value < min_quote and target_price > 0:
             need_amount = (min_quote / target_price).quantize(Decimal("1e-18"), rounding=ROUND_DOWN)
             adj_amount = dquant(need_amount, aprec)
@@ -120,9 +140,40 @@ def _prepare_and_place(cfg: dict):
             amount_base = min_base
             order_quote_value = (amount_base * target_price).quantize(Decimal("1e-18"), rounding=ROUND_DOWN)
 
+        # повторный «стопор» по балансу на случай подъёма из-за минимумов
         if order_quote_value > max_affordable_quote and target_price > 0:
             amount_base = dquant((max_affordable_quote / target_price).quantize(Decimal("1e-18"), rounding=ROUND_DOWN), aprec)
             order_quote_value = (amount_base * target_price).quantize(Decimal("1e-18"), rounding=ROUND_DOWN)
+
+        # --- уведомление об автоснижении объёма (с антиспамом 1 раз / 5 мин на пару, потокобезопасно) ---
+        if amount_base < requested_amount_base:
+            try:
+                now = time.time()
+                with _auto_resize_lock:
+                    last_ts = _auto_resize_last_ts.get(pair, 0.0)
+                    ok_to_send = (now - last_ts) >= AUTO_RESIZE_COOLDOWN_SEC
+
+                if ok_to_send:
+                    delta_pct = (requested_amount_base - amount_base) / requested_amount_base * Decimal(100) if requested_amount_base > 0 else Decimal(0)
+                    final_quote = order_quote_value  # уже посчитан выше
+                    msg = (
+                        f"[{pair}] Автокоррекция BUY из-за нехватки средств: "
+                        f"{fmt(requested_amount_base, aprec)} → {fmt(amount_base, aprec)} "
+                        f"(-{delta_pct.quantize(Decimal('1.00'))}%). "
+                        f"Цена={fmt(target_price, pprec)}, notional≈{final_quote} {quote_sym}. "
+                        f"Доступно={avail_quote} {quote_sym}, FEE_BUFFER={FEE_BUFFER}."
+                    )
+                    log.warning(msg)
+                    send_event("auto_resize_buy", msg)
+                    with _auto_resize_lock:
+                        _auto_resize_last_ts[pair] = now
+                else:
+                    remaining = 0
+                    with _auto_resize_lock:
+                        remaining = int(max(0, AUTO_RESIZE_COOLDOWN_SEC - (now - _auto_resize_last_ts.get(pair, 0.0))))
+                    log.debug(f"[{pair}] auto_resize_buy suppressed by cooldown ({remaining}s left)")
+            except Exception as _e:
+                log.debug("auto_resize_buy notify skipped: %r", _e)
 
     except Exception as e:
         return {"pair": pair, "ok": False, "error": f"amount calc error: {e}"}
@@ -145,6 +196,7 @@ def _prepare_and_place(cfg: dict):
         traceback.print_exc()
         set_last_order_id(pair, None)
         return {"pair": pair, "ok": False, "error": f"place_limit_buy error: {e}"}
+
 
 def _cleanup_pair(cfg: dict):
     pair = cfg["pair"]
@@ -186,6 +238,7 @@ def _cleanup_pair(cfg: dict):
         print(f"[{pair}] final drain error: {e}")
 
     return {"pair": pair, "ok": True}
+
 
 def trading_cycle():
     if not API_KEY or not API_SECRET:

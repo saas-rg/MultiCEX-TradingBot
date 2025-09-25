@@ -1,0 +1,12 @@
+warning: in the working copy of '.idea/workspace.xml', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'core/drain.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'core/strategy.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'core/sync.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'runner.py', LF will be replaced by CRLF the next time Git touches it
+ .idea/MultiCEX-TradingBot.iml |  6 [32m++[m[31m-[m
+ .idea/workspace.xml           | 96 [32m+++++++++++++++++++++++++++++++++++++++[m[31m----[m
+ core/drain.py                 |  2 [32m+[m[31m-[m
+ core/strategy.py              | 55 [32m++++++++++++++++++++++++[m[31m-[m
+ core/sync.py                  |  2 [32m+[m[31m-[m
+ runner.py                     |  8 [32m+++[m[31m-[m
+ 6 files changed, 154 insertions(+), 15 deletions(-)

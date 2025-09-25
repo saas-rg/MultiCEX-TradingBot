@@ -1,7 +1,7 @@
 import time
 from decimal import Decimal
 from core.quant import dquant, fmt
-from exchanges.gate import get_available, market_sell
+from core.exchange_proxy import get_available, market_sell
 from config import SELL_DRAIN_SLEEP, DRAIN_MAX_SECONDS, DRAIN_SLEEP_MAX, ACCOUNT_TYPE
 
 def drain_base_position(pair: str, base: str, amount_prec: int, min_base: Decimal) -> Decimal:
