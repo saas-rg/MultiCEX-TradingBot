@@ -1,6 +1,6 @@
 import time
 from config import NEXT_BAR_BUFFER_SEC
-from exchanges.gate import get_server_time_epoch
+from core.exchange_proxy import get_server_time_epoch
 
 def sleep_until_next_minute(buffer_sec: float | None = None):
     buf = NEXT_BAR_BUFFER_SEC if buffer_sec is None else buffer_sec

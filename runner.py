@@ -3,7 +3,8 @@ import signal
 import sys
 from core.params import list_pairs, ensure_schema
 from core.strategy import trading_cycle
-from exchanges.gate import cancel_all_open_orders
+from core import exchange_proxy
+from core.exchange_proxy import cancel_all_open_orders
 from core.telemetry import send_event
 
 def _cancel_all_pairs_orders():
@@ -32,6 +33,11 @@ def _handle_signal(signum, frame):
 
 def main():
     ensure_schema()
+
+    # Инициализация адаптера биржи (Gate в v0.7.1) — используем корневой config.py
+    import config                      # <-- ВАЖНО: из корня проекта
+    exchange_proxy.init_adapter(config)
+
     # Реконсиляция перед стартом + телеметрия
     try:
         _cancel_all_pairs_orders()
