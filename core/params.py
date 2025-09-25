@@ -17,6 +17,8 @@ class PairCfg(TypedDict, total=False):
     gap_mode: GapMode
     gap_switch_pct: Decimal
     enabled: bool
+    # v0.7.2 ↓ добавлено поле биржи (пока дефолт — "gate")
+    exchange: str  # "gate" (для совместимости; миграции БД пока нет)
 
 ALLOWED_KEYS = {
     "PAIR": str,
@@ -182,7 +184,7 @@ def list_pairs(include_disabled: bool = False) -> List[PairCfg]:
 
     out: List[PairCfg] = []
     for r in rows:
-        out.append(PairCfg(
+        cfg = PairCfg(
             idx=int(r[0]),
             pair=str(r[1]),
             deviation_pct=Decimal(str(r[2])),
@@ -191,7 +193,10 @@ def list_pairs(include_disabled: bool = False) -> List[PairCfg]:
             gap_mode=str(r[5]),
             gap_switch_pct=Decimal(str(r[6])),
             enabled=bool(int(r[7])) if not isinstance(r[7], bool) else bool(r[7]),
-        ))
+        )
+        # v0.7.2 ↓ аккуратно добавляем биржу по умолчанию (Gate), без миграции БД
+        cfg["exchange"] = "gate"
+        out.append(cfg)
     return out
 
 def upsert_pairs(pairs: List[PairCfg]) -> List[PairCfg]:
@@ -215,6 +220,7 @@ def upsert_pairs(pairs: List[PairCfg]) -> List[PairCfg]:
             gap_mode=str(p.get("gap_mode","down_only")).lower(),
             gap_switch_pct=Decimal(str(p.get("gap_switch_pct","1"))),
             enabled=bool(p.get("enabled", True)),
+            # exchange намеренно не пишем в БД в v0.7.2 (нет миграции); на чтении ставим "gate"
         ))
 
     conn = get_conn()

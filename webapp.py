@@ -18,7 +18,7 @@ from core.reporting import (
 from core.telemetry import send_event
 from config import ADMIN_TOKEN as CONF_ADMIN_TOKEN
 
-app = FastAPI(title="CEX Trading Bot API", version="2.4.0")
+app = FastAPI(title="CEX Trading Bot API", version="2.4.1")
 
 # ========== Admin token handling ==========
 ADMIN_TOKEN = (CONF_ADMIN_TOKEN or os.getenv("ADMIN_TOKEN", "")).strip()
@@ -80,6 +80,8 @@ def _norm_dec(v: Any) -> str:
 def _pair_to_view(p) -> Dict[str, str]:
     return {
         "idx": str(p.get("idx", "")),
+        # v0.7.2: показываем биржу (дефолт 'gate', чтобы не ломать старые записи)
+        "exchange": str(p.get("exchange", "gate")),
         "pair": str(p.get("pair", "")),
         "deviation_pct": _norm_dec(p.get("deviation_pct", "")),
         "quote": _norm_dec(p.get("quote", "")),
@@ -142,7 +144,15 @@ def root():
 def status():
     p = load_overrides()
     rep_enabled, rep_period = get_report_settings()
-    return {"status": "ok", "paused": get_paused(), "params": {k: str(v) for k, v in p.items()}, "reporting": {"enabled": rep_enabled, "period_min": rep_period}}
+    # v0.7.2: добавим состояния по парам (с биржей), не ломая старое поле params
+    pairs_view = [_pair_to_view(x) for x in list_pairs(include_disabled=True)]
+    return {
+        "status": "ok",
+        "paused": get_paused(),
+        "params": {k: str(v) for k, v in p.items()},
+        "reporting": {"enabled": rep_enabled, "period_min": rep_period},
+        "pairs": pairs_view,  # <-- добавлено
+    }
 
 @app.get("/params", dependencies=[Depends(require_admin)])
 def get_params():
@@ -182,6 +192,7 @@ def put_pairs(body: PairsBody):
             "gap_mode": p.gap_mode,
             "gap_switch_pct": Decimal(str(p.gap_switch_pct)),
             "enabled": bool(p.enabled),
+            # exchange намеренно не пишем/не редактируем в v0.7.2 (только отображение)
         })
     after_arr = upsert_pairs(arr)
     after_map = _pairs_map(after_arr)
@@ -247,7 +258,7 @@ def send_reporting_now():
 def admin_ui():
     return HTML_PAGE
 
-# --- HTML ниже не менялся функционально (последняя версия 2.3.0), оставить как в вашем рабочем файле ---
+# --- HTML (минимальные правки: колонка Exchange; показ row.exchange) ---
 HTML_PAGE = """<!doctype html>
 <html lang="ru"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
 <title>CEX Trading Bot — Admin</title>
@@ -297,7 +308,7 @@ label{font-size:13px;color:#cbd5e1;margin-right:8px}
 <div style="height:12px"></div>
 
 <table id="pairs"><thead><tr>
-  <th>#</th><th>PAIR</th><th>DEV %</th><th>QUOTE</th><th>LOT_BASE</th><th>GAP_MODE</th><th>GAP %</th><th>ENABLED</th>
+  <th>#</th><th>Exchange</th><th>PAIR</th><th>DEV %</th><th>QUOTE</th><th>LOT_BASE</th><th>GAP_MODE</th><th>GAP %</th><th>ENABLED</th>
 </tr></thead><tbody></tbody></table>
 
 <div class="small">Подсказка: QUOTE игнорируется, если LOT_BASE &gt; 0</div>
@@ -351,7 +362,7 @@ function setBadge(paused){ const dot=document.getElementById('status-dot'); cons
   else { dot.className='status-dot dot-off'; label.textContent='Статус: неизвестно'; }
 }
 
-function emptyRow(i){ return { idx:i, pair:'', deviation_pct:'', quote:'', lot_size_base:'', gap_mode:'down_only', gap_switch_pct:'', enabled:'true' }; }
+function emptyRow(i){ return { idx:i, exchange:'gate', pair:'', deviation_pct:'', quote:'', lot_size_base:'', gap_mode:'down_only', gap_switch_pct:'', enabled:'true' }; }
 
 async function reload(){
   try{
@@ -376,8 +387,10 @@ async function reload(){
 
 function addRow(tbody, i, row){
   const tr=document.createElement('tr');
+  const ex = row.exchange || 'gate';
   tr.innerHTML = `
     <td>${i}</td>
+    <td><div class="small">${ex}</div></td>
     <td><input id="PAIR_${i}" placeholder="BTC_USDT" value="${row.pair||''}"/></td>
     <td><input id="DEV_${i}" type="number" step="0.1" min="0" max="100" value="${row.deviation_pct||''}"/></td>
     <td><input id="QUOTE_${i}" type="number" step="0.01" min="0" value="${row.quote||''}"/></td>
