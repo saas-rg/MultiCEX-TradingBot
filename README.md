@@ -2,6 +2,14 @@
 
 ## Версии
 
+- **v0.8.0 (2025-09-27)**
+  - Multi-exchange registry (gate, htx) + lazy imports.
+  - Pairs config with exchange binding; web admin supports exchange select.
+  - Engine routes ops through exchange proxy; per-exchange cancel_all at start/pause/new BUY.
+  - Reporting: exchange column in CSV; NET per (exchange+pair); JSON summary endpoint.
+  - HTX Spot adapter (MVP): prices/limits/orders/balances/trades.
+  - Verified concurrent run: Gate testnet + HTX spot.
+
 - **v0.7.3 (2025-09-26)**
   - Подготовка к мультибиржевости;
   - DB: колонка bot_pairs.exchange (+ автомиграция);
