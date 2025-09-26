@@ -207,6 +207,57 @@ def list_my_trades(pair: str, limit: int = 200, since_ts: int = 0) -> List[Dict[
         })
     return out
 
+# --- NEW in v0.7.3 plumbing ---
+def fetch_trades(
+    *,
+    pair: str,
+    start_ts: int | None = None,
+    end_ts: int | None = None,
+    limit: int | None = None,
+    **kwargs
+) -> List[Dict[str, Any]]:
+    """
+    Унифицированная история трейдов для отчётности.
+    Источник — list_my_trades (под капотом REST /spot/my_trades).
+    Возвращаем формат:
+    {
+        "ts": int,                # unix seconds
+        "price": str,
+        "amount": str,
+        "side": "buy" | "sell",
+        "fee": str,
+        "fee_currency": str,
+        "trade_id": str,
+    }
+    Отфильтровано по [start_ts, end_ts], стабильно отсортировано по (ts, trade_id).
+    """
+    since = start_ts or 0
+    raw = list_my_trades(pair=pair, limit=limit or 200, since_ts=since)
+
+    out: List[Dict[str, Any]] = []
+    lo = start_ts or 0
+    hi = end_ts or 9_999_999_999
+
+    for t in raw:
+        ts = int(t.get("create_time", 0))
+        if ts < lo or ts > hi:
+            continue
+        out.append({
+            "ts": ts,
+            "price": str(t.get("price", "0")),
+            "amount": str(t.get("amount", "0")),
+            "side": str(t.get("side", "")).lower(),
+            "fee": str(t.get("fee", "0")),
+            "fee_currency": str(t.get("fee_currency", "USDT")),
+            "trade_id": str(t.get("id", "")),
+        })
+
+    # Стабильная сортировка и усечение по limit (если задан)
+    out.sort(key=lambda r: (int(r.get("ts", 0)), str(r.get("trade_id", ""))))
+    if limit is not None and limit > 0:
+        out = out[:limit]
+    return out
+
 def list_open_orders(pair: str) -> List[Dict[str, Any]]:
     """
     Возвращает открытые (неисполненные/неотменённые) ордера по паре.

@@ -17,6 +17,7 @@ from core.reporting import (
 )
 from core.telemetry import send_event
 from config import ADMIN_TOKEN as CONF_ADMIN_TOKEN
+from core.db_migrate import run_all as run_db_migrations
 
 app = FastAPI(title="CEX Trading Bot API", version="2.4.1")
 
@@ -69,6 +70,12 @@ class ReportingBody(BaseModel):
 @app.on_event("startup")
 def _startup():
     ensure_schema()
+    # v0.7.3: идемпотентные миграции (bot_pairs.exchange)
+    try:
+        run_db_migrations()
+    except Exception as e:
+        # Не валим веб на миграции, просто лог
+        print(f"[MIGRATE] Ошибка автомиграции: {e}")
 
 # ========== Helpers for diffs ==========
 def _norm_dec(v: Any) -> str:

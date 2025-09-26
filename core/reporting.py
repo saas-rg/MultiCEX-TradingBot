@@ -1,7 +1,7 @@
 # core/reporting.py
 from __future__ import annotations
 from decimal import Decimal
-from typing import Tuple, Dict, Any, List
+from typing import Tuple, Dict, Any, List, Optional
 import time, csv, io
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
@@ -11,53 +11,16 @@ from core.db import get_conn
 from core.params import list_pairs, get_paused
 from core.quant import fmt
 from core.telemetry import send_event, send_document
+from core import exchange_proxy  # <— теперь отчёты ходят через прокси
 
 # ========== Ключи настроек/рантайма ==========
 SETTINGS_KEY_ENABLED     = "REPORT_ENABLED"
 SETTINGS_KEY_PERIOD_MIN  = "REPORT_PERIOD_MIN"       # 1|5|10|15|30|60
 RUNTIME_KEY_LAST_END_TS  = "report_last_period_end"  # unix seconds конца ПРЕДЫДУЩЕГО завершенного периода
 
-# ======== HTTP-обёртка проекта (подписанные запросы) ========
-try:
-    from core.http import request as http_request  # type: ignore
-except Exception:
-    http_request = None
-
 # ======== Фоновый исполнитель для отчётов (НЕ блокирует торговлю) ========
 _BG_EXEC = ThreadPoolExecutor(max_workers=1, thread_name_prefix="reporting")
 _BG_LOCK = threading.Lock()  # защитимся от двойного планирования в одну и ту же минуту
-
-def _fetch_trades_gate(currency_pair: str, ts_from: int, ts_to: int, limit: int = 1000) -> List[Dict[str, Any]]:
-    """
-    Считывает сделки пользователя с Gate API v4: GET /spot/my_trades (SIGNED).
-    Для нашей обёртки request(...) query нужно передавать параметром `query`.
-    """
-    if http_request is None:
-        return []
-    params = {
-        "currency_pair": currency_pair,
-        "from": str(max(0, ts_from)),
-        "to": str(max(ts_from, ts_to)),
-        "limit": str(limit),
-    }
-    resp = http_request("GET", "/spot/my_trades", query=params, signed=True)  # type: ignore
-    if not isinstance(resp, (list, tuple)):
-        return []
-    out: List[Dict[str, Any]] = []
-    for it in resp:
-        try:
-            out.append({
-                "id": str(it.get("id", "")),
-                "side": str(it.get("side", "")),
-                "amount": Decimal(str(it.get("amount", "0"))),
-                "price":  Decimal(str(it.get("price", "0"))),
-                "create_time": int(float(it.get("create_time", it.get("create_time_ms", 0)))),
-                "fee": Decimal(str(it.get("fee", "0"))),
-                "fee_currency": str(it.get("fee_currency", "")),
-            })
-        except Exception:
-            continue
-    return out
 
 # ========== Утилиты БД ==========
 def _is_sqlite_conn(conn) -> bool:
@@ -169,52 +132,94 @@ def _is_first_minute_after(end_ts: int, now_ts: int) -> bool:
     first_minute_start = (end_ts + 1) // 60 * 60
     return first_minute_start <= now_ts <= first_minute_start + 59
 
+# ========== Нормализация форматов трейдов из адаптеров ==========
+def _norm_trade_row(tr: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Приводим различные варианты полей к единому виду:
+    вход: может быть как (ts/price/amount/side/fee/fee_currency/trade_id),
+         так и (create_time/price/amount/side/fee/fee_currency/id)
+    выход:
+        { "ts": int, "price": str, "amount": str, "side": "buy"|"sell",
+          "fee": str, "fee_currency": str, "trade_id": str }
+    """
+    try:
+        ts = tr.get("ts")
+        if ts is None:
+            ts = tr.get("create_time")
+        if ts is None:
+            return None
+        ts = int(ts)
+        price = str(tr.get("price", "0"))
+        amount = str(tr.get("amount", "0"))
+        side = str(tr.get("side", "")).lower()
+        fee = str(tr.get("fee", "0"))
+        fee_currency = str(tr.get("fee_currency", "USDT"))
+        trade_id = str(tr.get("trade_id", tr.get("id", "")))
+        return {
+            "ts": ts,
+            "price": price,
+            "amount": amount,
+            "side": side,
+            "fee": fee,
+            "fee_currency": fee_currency,
+            "trade_id": trade_id,
+        }
+    except Exception:
+        return None
+
 # ========== Сбор сделок ==========
 def _collect_trades_for_pairs(pairs: List[Dict[str, Any]], buy_win: Tuple[int,int], sell_win: Tuple[int,int]) -> List[Dict[str, Any]]:
     """
-    Собираем сделки по всем парам в нужных окнах. Здесь ещё не меняем знак quote_value — это сделаем в CSV/подсчёте.
+    Собираем сделки по всем парам в нужных окнах через exchange_proxy.
+    На выходе нормализованные строки для дальнейшего расчёта/CSV.
     """
     rows: List[Dict[str, Any]] = []
+
+    def _add_rows(exch: str, pair: str, base_sym: str, side_filter: str, tr_list: List[Dict[str, Any]]) -> None:
+        for tr in tr_list:
+            r = _norm_trade_row(tr)
+            if not r:
+                continue
+            if r["side"] != side_filter:
+                continue
+            ts = int(r["ts"])
+            rows.append({
+                "ts": ts,
+                "ts_iso": datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+                "exchange": exch,
+                "pair": pair,
+                "base": base_sym,
+                "side": side_filter.upper(),  # BUY|SELL
+                "price": r["price"],
+                "amount": r["amount"],
+                "fee": r.get("fee", "0"),
+                "fee_currency": r.get("fee_currency", ""),
+                "id": r.get("trade_id", ""),
+            })
+
     for p in pairs:
         pair = p["pair"]
-        exch = p.get("exchange", "gate")  # v0.7.2: биржа пары (по умолчанию gate)
+        exch = p.get("exchange", "gate")  # back-compat: по умолчанию gate
         base_sym = pair.split("_", 1)[0] if "_" in pair else pair
-        # BUY
-        for tr in _fetch_trades_gate(pair, buy_win[0], buy_win[1]):
-            if tr.get("side") != "buy":
-                continue
-            ts = int(tr["create_time"])
-            rows.append({
-                "ts": ts,
-                "ts_iso": datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
-                "exchange": exch,                 # <-- добавлено
-                "pair": pair,
-                "base": base_sym,
-                "side": "BUY",
-                "price": tr["price"],
-                "amount": tr["amount"],
-                "fee": tr.get("fee", Decimal("0")),
-                "fee_currency": tr.get("fee_currency", ""),
-                "id": tr.get("id","")
-            })
-        # SELL
-        for tr in _fetch_trades_gate(pair, sell_win[0], sell_win[1]):
-            if tr.get("side") != "sell":
-                continue
-            ts = int(tr["create_time"])
-            rows.append({
-                "ts": ts,
-                "ts_iso": datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
-                "exchange": exch,                 # <-- добавлено
-                "pair": pair,
-                "base": base_sym,
-                "side": "SELL",
-                "price": tr["price"],
-                "amount": tr["amount"],
-                "fee": tr.get("fee", Decimal("0")),
-                "fee_currency": tr.get("fee_currency", ""),
-                "id": tr.get("id","")
-            })
+
+        # BUY: [S-60, E-60]
+        try:
+            buy_trades = exchange_proxy.fetch_trades(
+                pair=pair, exchange=exch, start_ts=buy_win[0], end_ts=buy_win[1], limit=1000
+            ) or []
+        except Exception:
+            buy_trades = []
+        _add_rows(exch, pair, base_sym, "buy", buy_trades)
+
+        # SELL: [S, E]
+        try:
+            sell_trades = exchange_proxy.fetch_trades(
+                pair=pair, exchange=exch, start_ts=sell_win[0], end_ts=sell_win[1], limit=1000
+            ) or []
+        except Exception:
+            sell_trades = []
+        _add_rows(exch, pair, base_sym, "sell", sell_trades)
+
     rows.sort(key=lambda r: (r["ts"], r["id"]))
     return rows
 
@@ -274,7 +279,7 @@ def build_report_text(period_min: int, ref_end_ts: int) -> str:
     # Итог NET (USDT) — дублирует CSV
     lines.append(f"<b>Итог NET (USDT):</b> {fmt(net, 6)}")
     for p in pairs:
-        exch = p.get("exchange", "gate")  # v0.7.2: показываем биржу в телеметрии
+        exch = p.get("exchange", "gate")  # отображаем биржу в телеметрии
         lines.append(
             "• [{ex}:{pair}] dev={dev}% {mode}/{gs}% {lot_or_quote} {en}".format(
                 ex=exch,
@@ -329,7 +334,7 @@ def build_report_csv(period_min: int, ref_end_ts: int) -> bytes:
         ])
 
     net = total_quote - total_fee_usdt
-    # Итоговая строка (оставляем формат как был; без "exchange")
+    # Итоговая строка (оставляем формат как был; поле exchange агрегируем как ALL)
     wr.writerow([
         "TOTAL", "", "ALL", "NET",
         "", "", str(net),

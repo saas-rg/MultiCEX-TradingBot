@@ -1,6 +1,6 @@
 # core/params.py
 from decimal import Decimal
-from typing import Dict, Any, List, TypedDict, Literal
+from typing import Dict, Any, List, TypedDict, Literal, Tuple
 from config import (
     PAIR, DEVIATION_PCT, QUOTE_USDT, LOT_SIZE_BASE, GAP_MODE, GAP_SWITCH_PCT,
 )
@@ -17,8 +17,8 @@ class PairCfg(TypedDict, total=False):
     gap_mode: GapMode
     gap_switch_pct: Decimal
     enabled: bool
-    # v0.7.2 ↓ добавлено поле биржи (пока дефолт — "gate")
-    exchange: str  # "gate" (для совместимости; миграции БД пока нет)
+    # начиная с v0.7.2/0.7.3 — поле биржи (в 0.7.3 уже есть в БД; в старых БД — дефолт 'gate')
+    exchange: str  # "gate"
 
 ALLOWED_KEYS = {
     "PAIR": str,
@@ -50,6 +50,34 @@ def _is_sqlite_conn(conn) -> bool:
     if not hasattr(conn, "closed") and hasattr(conn, "execute"):
         return True
     return False
+
+def _has_column(conn, table: str, column: str) -> bool:
+    """
+    Идемпотентно проверяет наличие колонки в таблице для SQLite/Postgres.
+    """
+    cur = None
+    try:
+        cur = conn.cursor()
+        if _is_sqlite_conn(conn):
+            cur.execute(f"PRAGMA table_info({table})")
+            rows = cur.fetchall() or []
+            cols = [row[1] for row in rows]  # имя колонки — 2-й столбец
+            return column in cols
+        else:
+            cur.execute("""
+                SELECT 1
+                  FROM information_schema.columns
+                 WHERE table_name=%s AND column_name=%s
+                 LIMIT 1
+            """, (table, column))
+            return cur.fetchone() is not None
+    except Exception:
+        return False
+    finally:
+        try:
+            cur and cur.close()
+        except Exception:
+            pass
 
 def ensure_schema():
     init_db()
@@ -164,44 +192,72 @@ def upsert_params(upd: Dict[str, Any]) -> Dict[str, Any]:
         except Exception: pass
     return load_overrides()
 
-def list_pairs(include_disabled: bool = False) -> List[PairCfg]:
-    conn = get_conn()
+def _select_pairs_rows(conn, include_disabled: bool, has_exchange: bool) -> Tuple[List[tuple], List[str]]:
+    """
+    Унифицированный SELECT по bot_pairs с/без колонки exchange.
+    Возвращает (rows, cols).
+    """
     cur = None
     try:
         cur = conn.cursor()
+        base_cols = "idx, pair, deviation_pct, quote, lot_size_base, gap_mode, gap_switch_pct, enabled"
+        cols = base_cols + (", exchange" if has_exchange else "")
         if include_disabled:
-            cur.execute("SELECT idx, pair, deviation_pct, quote, lot_size_base, gap_mode, gap_switch_pct, enabled FROM bot_pairs ORDER BY idx ASC")
+            if _is_sqlite_conn(conn):
+                cur.execute(f"SELECT {cols} FROM bot_pairs ORDER BY idx ASC")
+            else:
+                cur.execute(f"SELECT {cols} FROM bot_pairs ORDER BY idx ASC")
         else:
             if _is_sqlite_conn(conn):
-                cur.execute("SELECT idx, pair, deviation_pct, quote, lot_size_base, gap_mode, gap_switch_pct, enabled FROM bot_pairs WHERE enabled = 1 ORDER BY idx ASC")
+                cur.execute(f"SELECT {cols} FROM bot_pairs WHERE enabled = 1 ORDER BY idx ASC")
             else:
-                cur.execute("SELECT idx, pair, deviation_pct, quote, lot_size_base, gap_mode, gap_switch_pct, enabled FROM bot_pairs WHERE enabled = %s ORDER BY idx ASC", (True,))
+                cur.execute(f"SELECT {cols} FROM bot_pairs WHERE enabled = %s ORDER BY idx ASC", (True,))
         rows = cur.fetchall()
+        colnames = [d[0] for d in cur.description] if getattr(cur, "description", None) else cols.split(", ")
+        return rows, colnames
     finally:
         try:
-            if cur is not None: cur.close()
-        except Exception: pass
+            cur and cur.close()
+        except Exception:
+            pass
+
+def list_pairs(include_disabled: bool = False) -> List[PairCfg]:
+    conn = get_conn()
+    has_ex = _has_column(conn, "bot_pairs", "exchange")
+    rows, cols = _select_pairs_rows(conn, include_disabled, has_ex)
 
     out: List[PairCfg] = []
+    # создадим индекс колонки по имени, чтобы не зависеть от порядка
+    col_idx = {name: i for i, name in enumerate(cols)}
+
     for r in rows:
         cfg = PairCfg(
-            idx=int(r[0]),
-            pair=str(r[1]),
-            deviation_pct=Decimal(str(r[2])),
-            quote=Decimal(str(r[3])),
-            lot_size_base=Decimal(str(r[4])),
-            gap_mode=str(r[5]),
-            gap_switch_pct=Decimal(str(r[6])),
-            enabled=bool(int(r[7])) if not isinstance(r[7], bool) else bool(r[7]),
+            idx=int(r[col_idx["idx"]]),
+            pair=str(r[col_idx["pair"]]),
+            deviation_pct=Decimal(str(r[col_idx["deviation_pct"]])),
+            quote=Decimal(str(r[col_idx["quote"]])),
+            lot_size_base=Decimal(str(r[col_idx["lot_size_base"]])),
+            gap_mode=str(r[col_idx["gap_mode"]]),
+            gap_switch_pct=Decimal(str(r[col_idx["gap_switch_pct"]])),
+            enabled=bool(int(r[col_idx["enabled"]])) if not isinstance(r[col_idx["enabled"]], bool) else bool(r[col_idx["enabled"]]),
         )
-        # v0.7.2 ↓ аккуратно добавляем биржу по умолчанию (Gate), без миграции БД
-        cfg["exchange"] = "gate"
+        # exchange: из БД или дефолт 'gate' (для обратной совместимости)
+        if has_ex and "exchange" in col_idx:
+            cfg["exchange"] = str(r[col_idx["exchange"]]) or "gate"
+        else:
+            cfg["exchange"] = "gate"
         out.append(cfg)
+
     return out
 
 def upsert_pairs(pairs: List[PairCfg]) -> List[PairCfg]:
+    """
+    В v0.7.3 UI ещё не даёт менять биржу, поэтому мы принудительно
+    сохраняем exchange='gate'. При отсутствии колонки — просто не пишем её.
+    """
     if len(pairs) > 5:
         raise ValueError("Можно задать не более 5 пар")
+
     norm: List[PairCfg] = []
     seen_pairs: set[str] = set()
     for i, p in enumerate(pairs, start=1):
@@ -218,32 +274,56 @@ def upsert_pairs(pairs: List[PairCfg]) -> List[PairCfg]:
             quote=Decimal(str(p.get("quote","0"))),
             lot_size_base=Decimal(str(p.get("lot_size_base","0"))),
             gap_mode=str(p.get("gap_mode","down_only")).lower(),
-            gap_switch_pct=Decimal(str(p.get("gap_switch_pct","1"))),
+            gap_switch_pct=Decimal(str(p.get("gap_switch_p ct","1"))) if "gap_switch_p ct" in p else Decimal(str(p.get("gap_switch_pct","1"))),  # защищаемся от опечаток
             enabled=bool(p.get("enabled", True)),
-            # exchange намеренно не пишем в БД в v0.7.2 (нет миграции); на чтении ставим "gate"
+            exchange="gate",  # v0.7.3: фиксируем gate
         ))
 
     conn = get_conn()
+    has_ex = _has_column(conn, "bot_pairs", "exchange")
     cur = None
     try:
         cur = conn.cursor()
+        # Полная замена набора, как и раньше
         cur.execute("DELETE FROM bot_pairs;")
         is_sqlite = _is_sqlite_conn(conn)
         for p in norm:
-            if is_sqlite:
-                cur.execute(
-                    "INSERT INTO bot_pairs(idx, pair, deviation_pct, quote, lot_size_base, gap_mode, gap_switch_pct, enabled) VALUES (?,?,?,?,?,?,?,?)",
-                    (p["idx"], p["pair"], str(p["deviation_pct"]), str(p["quote"]), str(p["lot_size_base"]),
-                     p["gap_mode"], str(p["gap_switch_pct"]), 1 if p["enabled"] else 0)
-                )
+            if has_ex:
+                # вставляем с exchange
+                if is_sqlite:
+                    cur.execute(
+                        "INSERT INTO bot_pairs(idx, pair, deviation_pct, quote, lot_size_base, gap_mode, gap_switch_pct, enabled, exchange) "
+                        "VALUES (?,?,?,?,?,?,?,?,?)",
+                        (p["idx"], p["pair"], str(p["deviation_pct"]), str(p["quote"]), str(p["lot_size_base"]),
+                         p["gap_mode"], str(p["gap_switch_pct"]), 1 if p["enabled"] else 0, p["exchange"])
+                    )
+                else:
+                    cur.execute(
+                        "INSERT INTO bot_pairs(idx, pair, deviation_pct, quote, lot_size_base, gap_mode, gap_switch_pct, enabled, exchange) "
+                        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                        (p["idx"], p["pair"], str(p["deviation_pct"]), str(p["quote"]), str(p["lot_size_base"]),
+                         p["gap_mode"], str(p["gap_switch_pct"]), True if p["enabled"] else False, p["exchange"])
+                    )
             else:
-                cur.execute(
-                    "INSERT INTO bot_pairs(idx, pair, deviation_pct, quote, lot_size_base, gap_mode, gap_switch_pct, enabled) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
-                    (p["idx"], p["pair"], str(p["deviation_pct"]), str(p["quote"]), str(p["lot_size_base"]),
-                     p["gap_mode"], str(p["gap_switch_pct"]), True)
-                )
+                # старая БД — без exchange
+                if is_sqlite:
+                    cur.execute(
+                        "INSERT INTO bot_pairs(idx, pair, deviation_pct, quote, lot_size_base, gap_mode, gap_switch_pct, enabled) "
+                        "VALUES (?,?,?,?,?,?,?,?)",
+                        (p["idx"], p["pair"], str(p["deviation_pct"]), str(p["quote"]), str(p["lot_size_base"]),
+                         p["gap_mode"], str(p["gap_switch_pct"]), 1 if p["enabled"] else 0)
+                    )
+                else:
+                    cur.execute(
+                        "INSERT INTO bot_pairs(idx, pair, deviation_pct, quote, lot_size_base, gap_mode, gap_switch_pct, enabled) "
+                        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+                        (p["idx"], p["pair"], str(p["deviation_pct"]), str(p["quote"]), str(p["lot_size_base"]),
+                         p["gap_mode"], str(p["gap_switch_pct"]), True if p["enabled"] else False)
+                    )
     finally:
         try:
             if cur is not None: cur.close()
-        except Exception: pass
+        except Exception:
+            pass
+
     return list_pairs(include_disabled=True)
