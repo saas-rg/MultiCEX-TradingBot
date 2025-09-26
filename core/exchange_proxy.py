@@ -54,3 +54,16 @@ def get_order_detail(pair: str, order_id: str) -> Dict[str, Any]:
 
 def get_available(asset: str) -> Decimal:
     return _require().get_available(asset)
+
+from typing import Any, Optional, List, Dict
+
+def fetch_trades(pair: str, *, exchange: Optional[str] = None,
+                 start_ts: Optional[int] = None, end_ts: Optional[int] = None,
+                 limit: Optional[int] = None, **kwargs) -> List[Dict[str, Any]]:
+    """
+    Унифицированный доступ к истории сделок для отчётности.
+    exchange пока игнорируем (у нас один активный адаптер Gate),
+    но оставляем параметр для будущей мультибиржевости.
+    """
+    # Пока просто делегируем в текущий активный адаптер
+    return _require().fetch_trades(pair=pair, start_ts=start_ts, end_ts=end_ts, limit=limit, **kwargs)

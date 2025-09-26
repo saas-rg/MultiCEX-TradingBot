@@ -6,6 +6,7 @@ from core.strategy import trading_cycle
 from core import exchange_proxy
 from core.exchange_proxy import cancel_all_open_orders
 from core.telemetry import send_event
+from core.db_migrate import run_all as run_db_migrations
 
 def _cancel_all_pairs_orders():
     try:
@@ -33,6 +34,11 @@ def _handle_signal(signum, frame):
 
 def main():
     ensure_schema()
+    # v0.7.3: идемпотентные миграции (bot_pairs.exchange)
+    try:
+        run_db_migrations()
+    except Exception as e:
+        print(f"[MIGRATE] Ошибка автомиграции: {e}")
 
     # Инициализация адаптера биржи (Gate в v0.7.1) — используем корневой config.py
     import config                      # <-- ВАЖНО: из корня проекта
