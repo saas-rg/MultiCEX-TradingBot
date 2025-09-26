@@ -2,6 +2,16 @@
 
 ## Версии
 
+- **v0.7.3 (2025-09-26)**
+  - Подготовка к мультибиржевости;
+  - DB: колонка bot_pairs.exchange (+ автомиграция);
+  - params: list_pairs/upsert_pairs с exchange (back-compat);
+  - exchange_proxy + GateV4Adapter: fetch_trades;
+  - exchanges/gate: fetch_trades;
+  - reporting через прокси;
+  - webapp показывает exchange, UI пока не редактирует;
+  - Поведение торговли не изменилось (только Gate).
+
 - **v0.7.2 (2025-09-25)**
   - Рефакторинг конфигурации: пары в формате EXCHANGE=...,PAIR=...;
   - CSV и телеметрия: добавлена колонка exchange (по умолчанию = gate);
