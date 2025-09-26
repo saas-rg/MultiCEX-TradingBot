@@ -43,6 +43,7 @@ def _compute_base_and_target(ad, pair: str, gap_mode: str, gap_switch_pct: Decim
 
     def _switch_downonly(gap: Decimal) -> bool:
         return gap > gap_switch_pct
+
     def _switch_symmetric(gap: Decimal) -> bool:
         return abs(gap) > gap_switch_pct
 
