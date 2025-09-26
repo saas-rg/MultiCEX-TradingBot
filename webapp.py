@@ -7,6 +7,9 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field, conlist
 from typing import Optional, Dict, Any, Literal, List, Tuple
 
+from core import exchange_proxy
+import config as CONF
+
 from core.params import (
     load_overrides, upsert_params, get_paused, set_paused, ensure_schema,
     list_pairs, upsert_pairs
@@ -83,6 +86,8 @@ def _startup():
     except Exception as e:
         # Не валим веб на миграции, просто лог
         print(f"[MIGRATE] Ошибка автомиграции: {e}")
+    # Мультибиржевой реестр + дефолтный адаптер Gate
+    exchange_proxy.init_adapter(CONF)
 
 # ========== Helpers for diffs ==========
 def _norm_dec(v: Any) -> str:

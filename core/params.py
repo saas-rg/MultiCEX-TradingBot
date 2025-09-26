@@ -5,6 +5,7 @@ from config import (
     PAIR, DEVIATION_PCT, QUOTE_USDT, LOT_SIZE_BASE, GAP_MODE, GAP_SWITCH_PCT,
 )
 from .db import get_conn, init_db
+from core.exchange_proxy import available_exchanges
 
 GapMode = Literal["off", "down_only", "symmetric"]
 
@@ -88,25 +89,43 @@ def ensure_schema():
         cur.execute("SELECT count(*) FROM bot_pairs;")
         row = cur.fetchone()
         cnt = int(row[0]) if row else 0
+
+        has_ex = _has_column(conn, "bot_pairs", "exchange")
+
         if cnt == 0:
             if _is_sqlite_conn(conn):
-                cur.execute(
-                    "INSERT INTO bot_pairs(idx, pair, deviation_pct, quote, lot_size_base, gap_mode, gap_switch_pct, enabled) "
-                    "VALUES (?,?,?,?,?,?,?,?)",
-                    (1, PAIR, str(DEVIATION_PCT), str(QUOTE_USDT), str(LOT_SIZE_BASE), GAP_MODE, str(GAP_SWITCH_PCT), 1)
-                )
+                if has_ex:
+                    cur.execute(
+                        "INSERT INTO bot_pairs(idx, pair, deviation_pct, quote, lot_size_base, gap_mode, gap_switch_pct, enabled, exchange) "
+                        "VALUES (?,?,?,?,?,?,?,?,?)",
+                        (1, PAIR, str(DEVIATION_PCT), str(QUOTE_USDT), str(LOT_SIZE_BASE), GAP_MODE, str(GAP_SWITCH_PCT), 1, "gate")
+                    )
+                else:
+                    cur.execute(
+                        "INSERT INTO bot_pairs(idx, pair, deviation_pct, quote, lot_size_base, gap_mode, gap_switch_pct, enabled) "
+                        "VALUES (?,?,?,?,?,?,?,?)",
+                        (1, PAIR, str(DEVIATION_PCT), str(QUOTE_USDT), str(LOT_SIZE_BASE), GAP_MODE, str(GAP_SWITCH_PCT), 1)
+                    )
             else:
-                cur.execute(
-                    "INSERT INTO bot_pairs(idx, pair, deviation_pct, quote, lot_size_base, gap_mode, gap_switch_pct, enabled) "
-                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
-                    (1, PAIR, str(DEVIATION_PCT), str(QUOTE_USDT), str(LOT_SIZE_BASE), GAP_MODE, str(GAP_SWITCH_PCT), True)
-                )
+                if has_ex:
+                    cur.execute(
+                        "INSERT INTO bot_pairs(idx, pair, deviation_pct, quote, lot_size_base, gap_mode, gap_switch_pct, enabled, exchange) "
+                        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                        (1, PAIR, str(DEVIATION_PCT), str(QUOTE_USDT), str(LOT_SIZE_BASE), GAP_MODE, str(GAP_SWITCH_PCT), True, "gate")
+                    )
+                else:
+                    cur.execute(
+                        "INSERT INTO bot_pairs(idx, pair, deviation_pct, quote, lot_size_base, gap_mode, gap_switch_pct, enabled) "
+                        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+                        (1, PAIR, str(DEVIATION_PCT), str(QUOTE_USDT), str(LOT_SIZE_BASE), GAP_MODE, str(GAP_SWITCH_PCT), True)
+                    )
     finally:
         try:
             if cur is not None:
                 cur.close()
         except Exception:
             pass
+
 
 def get_paused() -> bool:
     conn = get_conn()
@@ -252,31 +271,46 @@ def list_pairs(include_disabled: bool = False) -> List[PairCfg]:
 
 def upsert_pairs(pairs: List[PairCfg]) -> List[PairCfg]:
     """
-    В v0.7.3 UI ещё не даёт менять биржу, поэтому мы принудительно
-    сохраняем exchange='gate'. При отсутствии колонки — просто не пишем её.
+    Принимаем пары из /admin и полностью перезаписываем таблицу bot_pairs.
+    Теперь сохраняем exchange из запроса (валидация по реестру), без жёсткого 'gate'.
     """
-    if len(pairs) > 5:
-        raise ValueError("Можно задать не более 5 пар")
+    # Разрешённые биржи берём из реестра
+    allowed_ex = set(available_exchanges())  # например, {"gate","htx"}
 
     norm: List[PairCfg] = []
-    seen_pairs: set[str] = set()
+    seen_pairs: set[Tuple[str,str]] = set()  # (exchange, pair) если в будущем сделаем уникальность по двум полям
     for i, p in enumerate(pairs, start=1):
         pair = str(p.get("pair","")).strip().upper()
         if not pair or "_" not in pair:
             raise ValueError(f"Некорректный PAIR в слоте {i}: '{pair}'")
-        if pair in seen_pairs:
-            raise ValueError(f"Дубликат пары: {pair}")
-        seen_pairs.add(pair)
+
+        # биржа
+        ex = str(p.get("exchange","gate")).strip().lower() or "gate"
+        if ex not in allowed_ex:
+            raise ValueError(f"Некорректная биржа в слоте {i}: '{ex}'. Допустимо: {sorted(allowed_ex)}")
+
+        # проверка на дубликаты (по паре; если в будущем будет (exchange, pair) уникальность — поменяем ключ)
+        key = (ex, pair)
+        if key in seen_pairs:
+            raise ValueError(f"Дубликат пары для биржи {ex}: {pair}")
+        seen_pairs.add(key)
+
+        # аккуратно читаем gap_switch_pct (защита от опечаток)
+        if "gap_switch_pct" in p:
+            gs = Decimal(str(p.get("gap_switch_pct","1")))
+        else:
+            gs = Decimal(str(p.get("gap_switch_p ct","1"))) if "gap_switch_p ct" in p else Decimal("1")
+
         norm.append(PairCfg(
             idx=i,
+            exchange=ex,
             pair=pair,
             deviation_pct=Decimal(str(p.get("deviation_pct","0"))),
             quote=Decimal(str(p.get("quote","0"))),
             lot_size_base=Decimal(str(p.get("lot_size_base","0"))),
             gap_mode=str(p.get("gap_mode","down_only")).lower(),
-            gap_switch_pct=Decimal(str(p.get("gap_switch_p ct","1"))) if "gap_switch_p ct" in p else Decimal(str(p.get("gap_switch_pct","1"))),  # защищаемся от опечаток
+            gap_switch_pct=gs,
             enabled=bool(p.get("enabled", True)),
-            exchange="gate",  # v0.7.3: фиксируем gate
         ))
 
     conn = get_conn()
@@ -284,7 +318,7 @@ def upsert_pairs(pairs: List[PairCfg]) -> List[PairCfg]:
     cur = None
     try:
         cur = conn.cursor()
-        # Полная замена набора, как и раньше
+        # Полная замена набора (как и раньше)
         cur.execute("DELETE FROM bot_pairs;")
         is_sqlite = _is_sqlite_conn(conn)
         for p in norm:
@@ -305,7 +339,7 @@ def upsert_pairs(pairs: List[PairCfg]) -> List[PairCfg]:
                          p["gap_mode"], str(p["gap_switch_pct"]), True if p["enabled"] else False, p["exchange"])
                     )
             else:
-                # старая БД — без exchange
+                # старая БД — без exchange (сохраним пары, но биржа де-факто будет gate)
                 if is_sqlite:
                     cur.execute(
                         "INSERT INTO bot_pairs(idx, pair, deviation_pct, quote, lot_size_base, gap_mode, gap_switch_pct, enabled) "
@@ -327,3 +361,4 @@ def upsert_pairs(pairs: List[PairCfg]) -> List[PairCfg]:
             pass
 
     return list_pairs(include_disabled=True)
+
