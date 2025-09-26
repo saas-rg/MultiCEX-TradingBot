@@ -45,6 +45,11 @@ RETRIES = int(os.getenv("MAX_RETRIES", "2"))
 # Аккаунт
 ACCOUNT_TYPE = (os.getenv("ACCOUNT", "").strip() or None)
 
+# --- HTX keys (spot) ---
+HTX_API_KEY    = os.getenv("HTX_API_KEY", "").strip()
+HTX_API_SECRET = os.getenv("HTX_API_SECRET", "").strip()
+HTX_ACCOUNT_TYPE = (os.getenv("HTX_ACCOUNT_TYPE", "spot").strip() or "spot")
+
 # Админ-токен для веб-UI
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "").strip()
 

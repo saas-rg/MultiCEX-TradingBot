@@ -1,10 +1,14 @@
 # webapp.py
 import os
+import time
 from decimal import Decimal
 from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field, conlist
 from typing import Optional, Dict, Any, Literal, List, Tuple
+
+from core import exchange_proxy
+import config as CONF
 
 from core.params import (
     load_overrides, upsert_params, get_paused, set_paused, ensure_schema,
@@ -13,11 +17,15 @@ from core.params import (
 from core.reporting import (
     get_settings as get_report_settings,
     set_settings as set_report_settings,
-    send_report as send_report_now
+    send_report as send_report_now,
+    _align_period_end,
+    build_report_json,
 )
 from core.telemetry import send_event
 from config import ADMIN_TOKEN as CONF_ADMIN_TOKEN
 from core.db_migrate import run_all as run_db_migrations
+
+from core.exchange_proxy import available_exchanges
 
 app = FastAPI(title="CEX Trading Bot API", version="2.4.1")
 
@@ -48,6 +56,7 @@ class ParamsUpdate(BaseModel):
     GAP_SWITCH_PCT: Optional[float] = Field(None, ge=0, le=100)
 
 class PairItem(BaseModel):
+    exchange: Optional[str] = Field(None, description="gate|htx (если не указано — gate)")
     pair: str = Field(..., pattern=r"^[A-Z0-9]+_[A-Z0-9]+$")
     deviation_pct: float = Field(..., ge=0, le=100)
     quote: float = Field(..., ge=0)
@@ -57,7 +66,8 @@ class PairItem(BaseModel):
     enabled: bool = True
 
 class PairsBody(BaseModel):
-    pairs: conlist(PairItem, min_length=0, max_length=5)
+    # было conlist(..., max_length=5) — убираем ограничение
+    pairs: List[PairItem] = Field(default_factory=list)
 
 class PauseReq(BaseModel):
     paused: bool
@@ -76,6 +86,8 @@ def _startup():
     except Exception as e:
         # Не валим веб на миграции, просто лог
         print(f"[MIGRATE] Ошибка автомиграции: {e}")
+    # Мультибиржевой реестр + дефолтный адаптер Gate
+    exchange_proxy.init_adapter(CONF)
 
 # ========== Helpers for diffs ==========
 def _norm_dec(v: Any) -> str:
@@ -178,6 +190,10 @@ def put_params(body: ParamsUpdate):
 
     return {"ok": True, "params": {k: str(v) for k, v in after.items()}}
 
+@app.get("/api/exchanges", dependencies=[Depends(require_admin)])
+def api_exchanges():
+    return {"exchanges": available_exchanges()}
+
 # ========== Multi-pair endpoints ==========
 @app.get("/pairs", dependencies=[Depends(require_admin)])
 def get_pairs(include_disabled: bool = True):
@@ -191,7 +207,9 @@ def put_pairs(body: PairsBody):
 
     arr = []
     for p in body.pairs:
+        ex = (p.exchange or "gate").strip().lower()
         arr.append({
+            "exchange": ex,
             "pair": p.pair.upper(),
             "deviation_pct": Decimal(str(p.deviation_pct)),
             "quote": Decimal(str(p.quote)),
@@ -199,7 +217,6 @@ def put_pairs(body: PairsBody):
             "gap_mode": p.gap_mode,
             "gap_switch_pct": Decimal(str(p.gap_switch_pct)),
             "enabled": bool(p.enabled),
-            # exchange намеренно не пишем/не редактируем в v0.7.2 (только отображение)
         })
     after_arr = upsert_pairs(arr)
     after_map = _pairs_map(after_arr)
@@ -260,12 +277,23 @@ def send_reporting_now():
     send_event("manual_report", "Отчёт отправлен вручную из админки")
     return {"ok": True, "sent": bool(ok)}
 
+# ========== Reporting summary (JSON для админки/дашборда) ==========
+@app.get("/reporting/summary", dependencies=[Depends(require_admin)])
+def get_reporting_summary():
+    enabled, period_min = get_report_settings()
+    now = int(time.time())
+    end_ts = _align_period_end(now, period_min)
+    data = build_report_json(period_min, end_ts)
+    # добавим флаги для удобства фронта
+    data["enabled"] = enabled
+    return data
+
 # ========== Admin UI ==========
 @app.get("/admin", response_class=HTMLResponse)
 def admin_ui():
     return HTML_PAGE
 
-# --- HTML (минимальные правки: колонка Exchange; показ row.exchange) ---
+# --- HTML (минимальные правки: колонка Exchange editable; unlimited rows) ---
 HTML_PAGE = """<!doctype html>
 <html lang="ru"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
 <title>CEX Trading Bot — Admin</title>
@@ -273,7 +301,7 @@ HTML_PAGE = """<!doctype html>
 :root { --bg:#0f172a; --panel:#111827; --muted:#94a3b8; --text:#e5e7eb; --ok:#16a34a; --warn:#d97706; --err:#ef4444; --brand:#22d3ee; }
 *{box-sizing:border-box;font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Arial}
 body{margin:0;background:linear-gradient(180deg,#0b1220, #0f172a);color:var(--text)}
-.wrap{max-width:980px;margin:40px auto;padding:0 16px}
+.wrap{max-width:1280px;margin:40px auto;padding:0 16px}
 .card{background:rgba(17,24,39,.8);border:1px solid #1f2937;border-radius:16px;padding:20px;box-shadow:0 10px 30px rgba(0,0,0,.25)}
 h1{font-size:22px;margin:0 0 6px 0}
 .sub{color:var(--muted);font-size:13px;margin-bottom:16px}
@@ -303,24 +331,25 @@ label{font-size:13px;color:#cbd5e1;margin-right:8px}
 .switch{display:inline-flex;align-items:center;gap:8px;padding:8px 12px;border:1px solid #334155;border-radius:12px;background:#0b1220}
 </style></head><body>
 <div class="wrap"><div class="card">
-<h1>⚙️ CEX Trading Bot — Admin (мультипары)</h1>
-<div class="sub">До 5 пар. Для каждой пары — свои параметры.</div>
+<h1>⚙️ MultiCEX Trading Bot</h1>
+<div class="sub">Each pair has its own parameters. The number of rows is unlimited.</div>
 
 <div class="row">
-  <span class="badge"><span id="status-dot" class="status-dot dot-off"></span><span id="paused-label">Статус: неизвестно</span></span>
+  <span class="badge"><span id="status-dot" class="status-dot dot-off"></span><span id="paused-label">Status: unknow</span></span>
   <span class="sep"></span>
-  <button class="ghost" onclick="changeToken()">🔐 Ввести/сменить пароль</button>
+  <button class="ghost" onclick="changeToken()">🔐 Enter/change password</button>
 </div>
 
 <div style="height:12px"></div>
 
 <table id="pairs"><thead><tr>
-  <th>#</th><th>Exchange</th><th>PAIR</th><th>DEV %</th><th>QUOTE</th><th>LOT_BASE</th><th>GAP_MODE</th><th>GAP %</th><th>ENABLED</th>
+  <th>#</th><th>Exchange</th><th>PAIR</th><th>DEV %</th><th>QUOTE</th><th>LOT BASE</th><th>GAP MODE</th><th>GAP %</th><th>ENABLED</th>
 </tr></thead><tbody></tbody></table>
 
-<div class="small">Подсказка: QUOTE игнорируется, если LOT_BASE &gt; 0</div>
+<div class="small">Hint: [QUOTE] is ignored if [LOT BASE] &gt; 0</div>
 
 <div class="row" style="margin-top:16px">
+  <button class="ghost" onclick="addRow()">➕ Добавить строку</button>
   <button class="primary" onclick="save()">💾 Сохранить пары</button>
   <button class="ghost" onclick="reload()">🔄 Обновить</button>
   <button class="ok" onclick="setPause(false)">▶️ Снять паузу</button>
@@ -369,17 +398,88 @@ function setBadge(paused){ const dot=document.getElementById('status-dot'); cons
   else { dot.className='status-dot dot-off'; label.textContent='Статус: неизвестно'; }
 }
 
-function emptyRow(i){ return { idx:i, exchange:'gate', pair:'', deviation_pct:'', quote:'', lot_size_base:'', gap_mode:'down_only', gap_switch_pct:'', enabled:'true' }; }
+// список доступных бирж (подстрахуем дефолтом)
+let EXCHANGES = ['gate'];
+
+function exchangeSelect(current){
+  const sel = document.createElement('select');
+  EXCHANGES.forEach(ex=>{
+    const opt = document.createElement('option');
+    opt.value = ex; opt.textContent = ex;
+    if ((current||'gate') === ex) opt.selected = true;
+    sel.appendChild(opt);
+  });
+  return sel;
+}
+
+function addRow(row){
+  const tbody = document.querySelector('#pairs tbody');
+  const idx = tbody.children.length + 1;
+  const tr = document.createElement('tr');
+
+  const ex = (row && row.exchange) || 'gate';
+  const pair = (row && row.pair) || '';
+  const dev = (row && row.deviation_pct) || '';
+  const q   = (row && row.quote) || '';
+  const lot = (row && row.lot_size_base) || '';
+  const gm  = (row && row.gap_mode) || 'down_only';
+  const gp  = (row && row.gap_switch_pct) || '';
+  const en  = (row && String(row.enabled)) || 'true';
+
+  tr.innerHTML = `
+    <td>${idx}</td>
+    <td></td>
+    <td><input placeholder="BTC_USDT" value="${pair}"/></td>
+    <td><input type="number" step="0.1" min="0" max="100" value="${dev}"/></td>
+    <td><input type="number" step="0.01" min="0" value="${q}"/></td>
+    <td><input type="number" step="0.00000001" min="0" value="${lot}"/></td>
+    <td>
+      <select>
+        <option value="off" ${gm==='off'?'selected':''}>off</option>
+        <option value="down_only" ${gm==='down_only'?'selected':''}>down_only</option>
+        <option value="symmetric" ${gm==='symmetric'?'selected':''}>symmetric</option>
+      </select>
+    </td>
+    <td><input type="number" step="0.1" min="0" max="100" value="${gp}"/></td>
+    <td>
+      <select>
+        <option value="true" ${en!=='false'?'selected':''}>true</option>
+        <option value="false" ${en==='false'?'selected':''}>false</option>
+      </select>
+    </td>`;
+  // вставляем выпадающий список бирж в 2-ю колонку
+  tr.children[1].appendChild(exchangeSelect(ex));
+
+  tbody.appendChild(tr);
+}
 
 async function reload(){
   try{
+    const tbody = document.querySelector('#pairs tbody'); tbody.innerHTML='';
+
+    // 1) получить пары
     const s = await fetch('/pairs', { headers: authHeaders() });
     if (s.status===401){ toast('Неверный пароль (401). Нажмите «Ввести/сменить пароль».', false); return; }
     const data = await s.json();
-    const tbody = document.querySelector('#pairs tbody'); tbody.innerHTML='';
-    let arr = (data.pairs||[]);
-    for(let i=1;i<=5;i++){ let row = arr[i-1] || emptyRow(i); addRow(tbody, i, row); }
+    const arr = (data.pairs || []);
 
+    // 2) получить список бирж (для select)
+    try{
+      const r = await fetch('/api/exchanges', { headers: authHeaders() });
+      if (r.ok){
+        const js = await r.json();
+        if (Array.isArray(js.exchanges) && js.exchanges.length) EXCHANGES = js.exchanges;
+      }
+    }catch(_e){ /* fallback: EXCHANGES=['gate'] */ }
+
+    // 3) отрисовать все строки (если пусто — одну пустую)
+    if (arr.length === 0){
+      addRow({exchange:'gate'});
+    } else {
+      arr.forEach(row => addRow(row));
+    }
+
+    // 4) подтянуть статус/репортинг
     const stat = await fetch('/status', { headers: authHeaders() });
     if (stat.ok){
       const js = await stat.json();
@@ -392,48 +492,32 @@ async function reload(){
   }catch(e){ toast('Ошибка загрузки', false); }
 }
 
-function addRow(tbody, i, row){
-  const tr=document.createElement('tr');
-  const ex = row.exchange || 'gate';
-  tr.innerHTML = `
-    <td>${i}</td>
-    <td><div class="small">${ex}</div></td>
-    <td><input id="PAIR_${i}" placeholder="BTC_USDT" value="${row.pair||''}"/></td>
-    <td><input id="DEV_${i}" type="number" step="0.1" min="0" max="100" value="${row.deviation_pct||''}"/></td>
-    <td><input id="QUOTE_${i}" type="number" step="0.01" min="0" value="${row.quote||''}"/></td>
-    <td><input id="LOT_${i}" type="number" step="0.00000001" min="0" value="${row.lot_size_base||''}"/></td>
-    <td>
-      <select id="GAPM_${i}">
-        <option value="off" ${row.gap_mode==='off'?'selected':''}>off</option>
-        <option value="down_only" ${row.gap_mode==='down_only'?'selected':''}>down_only</option>
-        <option value="symmetric" ${row.gap_mode==='symmetric'?'selected':''}>symmetric</option>
-      </select>
-    </td>
-    <td><input id="GAPP_${i}" type="number" step="0.1" min="0" max="100" value="${row.gap_switch_pct||''}"/></td>
-    <td>
-      <select id="EN_${i}">
-        <option value="true" ${row.enabled!=='false'?'selected':''}>true</option>
-        <option value="false" ${row.enabled==='false'?'selected':''}>false</option>
-      </select>
-    </td>`;
-  tbody.appendChild(tr);
-}
-
 async function save(){
-  const body={pairs:[]};
-  for(let i=1;i<=5;i++){
-    const p=document.getElementById('PAIR_'+i).value.trim().toUpperCase();
-    const dev=document.getElementById('DEV_'+i).value.trim();
-    const q=document.getElementById('QUOTE_'+i).value.trim();
-    const lot=document.getElementById('LOT_'+i).value.trim();
-    const gm=document.getElementById('GAPM_'+i).value.trim();
-    const gp=document.getElementById('GAPP_'+i).value.trim();
-    const en=document.getElementById('EN_'+i).value.trim();
-    if (!p) continue;
-    body.pairs.push({ pair:p, deviation_pct:parseFloat(dev||'0'), quote:parseFloat(q||'0'), lot_size_base:parseFloat(lot||'0'), gap_mode:gm, gap_switch_pct:parseFloat(gp||'0'), enabled:(en==='true') });
+  const rows = Array.from(document.querySelectorAll('#pairs tbody tr'));
+  const body = { pairs: [] };
+  for (const tr of rows){
+    const ex  = tr.children[1].querySelector('select').value;
+    const p   = tr.children[2].querySelector('input').value.trim().toUpperCase();
+    const dev = tr.children[3].querySelector('input').value.trim();
+    const q   = tr.children[4].querySelector('input').value.trim();
+    const lot = tr.children[5].querySelector('input').value.trim();
+    const gm  = tr.children[6].querySelector('select').value.trim();
+    const gp  = tr.children[7].querySelector('input').value.trim();
+    const en  = tr.children[8].querySelector('select').value.trim();
+    if (!p) continue; // пустые строки не отправляем
+    body.pairs.push({
+      exchange: ex || 'gate',
+      pair: p,
+      deviation_pct: parseFloat(dev||'0'),
+      quote: parseFloat(q||'0'),
+      lot_size_base: parseFloat(lot||'0'),
+      gap_mode: gm,
+      gap_switch_pct: parseFloat(gp||'0'),
+      enabled: (en === 'true')
+    });
   }
   try{
-    const res = await fetch('/pairs', { method:'PUT', headers:Object.assign({"Content-Type":"application/json"}, authHeaders()), body:JSON.stringify(body) });
+    const res = await fetch('/pairs', { method:'PUT', headers:Object.assign({"Content-Type":"application/json"}, authHeaders()), body: JSON.stringify(body) });
     const data = await res.json();
     if (res.status===401){ toast('Неверный пароль (401).', false); return; }
     if (!res.ok || data.ok===false){ throw new Error(data.detail||JSON.stringify(data)); }
