@@ -4,9 +4,9 @@ import sys
 from core.params import list_pairs, ensure_schema
 from core.strategy import trading_cycle
 from core import exchange_proxy
-from core.exchange_proxy import cancel_all_open_orders
 from core.telemetry import send_event
 from core.db_migrate import run_all as run_db_migrations
+from core.exchange_proxy import get_adapter
 
 def _cancel_all_pairs_orders():
     try:
@@ -15,12 +15,14 @@ def _cancel_all_pairs_orders():
         print(f"[SHUTDOWN] Не удалось получить пары: {e}")
         return
     for cfg in pairs:
+        ex = (cfg.get("exchange") or "gate").strip().lower()
         p = cfg["pair"]
         try:
-            cancel_all_open_orders(p)
-            print(f"[CLEANUP] Отменены все открытые ордера по {p}")
+            ad = get_adapter(ex)
+            ad.cancel_all_open_orders(p)
+            print(f"[CLEANUP] Отменены все открытые ордера по {ex}:{p}")
         except Exception as e:
-            print(f"[CLEANUP] Ошибка отмены по {p}: {e}")
+            print(f"[CLEANUP] Ошибка отмены по {ex}:{p}: {e}")
 
 def _handle_signal(signum, frame):
     try:
@@ -40,9 +42,9 @@ def main():
     except Exception as e:
         print(f"[MIGRATE] Ошибка автомиграции: {e}")
 
-    # Инициализация адаптера биржи (Gate в v0.7.1) — используем корневой config.py
-    import config                      # <-- ВАЖНО: из корня проекта
-    exchange_proxy.init_adapter(config)
+    # Инициализация адаптера биржи по корневому config.py (Gate по умолчанию)
+    import config  # важно: из корня проекта
+    exchange_proxy.init_adapter(config)  # настраивает также мульти-реестр
 
     # Реконсиляция перед стартом + телеметрия
     try:
