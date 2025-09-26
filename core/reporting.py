@@ -252,23 +252,43 @@ def build_report_text(period_min: int, ref_end_ts: int) -> str:
     def ts_fmt(ts: int) -> str:
         return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
-    # Подсчёт NET (та же логика, что и в CSV)
+    # Подсчёт NET (М5: добавили разрез по (exchange, pair))
     rows = _collect_trades_for_pairs(pairs, (buy_s, buy_e), (sell_s, sell_e))
-    total_quote = Decimal("0")
-    total_fee_usdt = Decimal("0")
+
+    total_quote_all = Decimal("0")
+    total_fee_all   = Decimal("0")
+
+    # M5: агрегаты по (exchange, pair)
+    group_totals: Dict[Tuple[str, str], Dict[str, Decimal]] = {}  # {(ex, pair): {"q":..., "fee":...}}
+
     for r in rows:
         price  = Decimal(str(r["price"]))
         amount = Decimal(str(r["amount"]))
         fee    = Decimal(str(r.get("fee","0")))
         base   = str(r.get("base",""))
         side   = r["side"]
+        ex     = str(r.get("exchange","gate"))
+        pair   = str(r["pair"])
+
         qv = (amount * price)
         if side == "BUY":
             qv = -qv
         fee_usdt = _fee_to_usdt(side, base, fee, str(r.get("fee_currency","")), price)
-        total_quote += qv
-        total_fee_usdt += fee_usdt
-    net = total_quote - total_fee_usdt
+
+        # общий итог
+        total_quote_all += qv
+        total_fee_all   += fee_usdt
+
+        # по группе
+        key = (ex, pair)
+        g = group_totals.get(key)
+        if not g:
+            g = {"q": Decimal("0"), "fee": Decimal("0")}
+            group_totals[key] = g
+        g["q"]   += qv
+        g["fee"] += fee_usdt
+
+    net_all = total_quote_all - total_fee_all
 
     lines: List[str] = []
     lines.append(f"<b>Отчёт за период {period_min} мин</b>")
@@ -276,8 +296,20 @@ def build_report_text(period_min: int, ref_end_ts: int) -> str:
     lines.append(f"• BUY:  {ts_fmt(buy_s)} — {ts_fmt(buy_e)} (включ.)")
     lines.append(f"<b>Статус бота:</b> {'⏸️ пауза' if paused else '▶️ работает'}")
     lines.append(f"Всего пар: {len(pairs)}; активных: {sum(1 for p in pairs if p.get('enabled'))}")
-    # Итог NET (USDT) — дублирует CSV
-    lines.append(f"<b>Итог NET (USDT):</b> {fmt(net, 6)}")
+
+    # M5: NET по (exchange, pair)
+    if group_totals:
+        lines.append("<b>NET по биржам и парам (USDT):</b>")
+        # сортировка: по exchange, затем по pair
+        for (ex, pair) in sorted(group_totals.keys(), key=lambda k: (k[0], k[1])):
+            g = group_totals[(ex, pair)]
+            net_g = g["q"] - g["fee"]
+            lines.append(f"• [{ex}:{pair}] NET={fmt(net_g, 6)} (fee={fmt(g['fee'],6)} USDT)")
+
+    # Общий итог (USDT) — дублирует CSV
+    lines.append(f"<b>Итог NET (USDT):</b> {fmt(net_all, 6)}")
+
+    # Справочная строка по конфигурации пар (как было)
     for p in pairs:
         exch = p.get("exchange", "gate")  # отображаем биржу в телеметрии
         lines.append(
@@ -301,12 +333,15 @@ def build_report_csv(period_min: int, ref_end_ts: int) -> bytes:
 
     rows = _collect_trades_for_pairs(pairs, (buy_s, buy_e), (sell_s, sell_e))
 
-    total_quote = Decimal("0")
-    total_fee_usdt = Decimal("0")
+    total_quote_all = Decimal("0")
+    total_fee_all   = Decimal("0")
+
+    # M5: агрегаты по (exchange, pair)
+    group_totals: Dict[Tuple[str, str], Dict[str, Decimal]] = {}  # {(ex, pair): {"q":..., "fee":...}}
 
     buf = io.StringIO()
     wr = csv.writer(buf)
-    # v0.7.2: добавили колонку exchange (третьей)
+    # v0.7.2+: колонка exchange (третья)
     wr.writerow(["ts","ts_iso","exchange","pair","side","price","amount","quote_value","fee","fee_currency","trade_id"])
 
     for r in rows:
@@ -315,6 +350,8 @@ def build_report_csv(period_min: int, ref_end_ts: int) -> bytes:
         fee    = Decimal(str(r.get("fee", "0")))
         base   = str(r.get("base",""))
         side   = r["side"]
+        ex     = str(r.get("exchange","gate"))
+        pair   = str(r["pair"])
 
         # quote_value: BUY отрицательный, SELL положительный
         qv = (amount * price)
@@ -324,21 +361,42 @@ def build_report_csv(period_min: int, ref_end_ts: int) -> bytes:
         # fee в USDT (накапливаем для NET)
         fee_usdt = _fee_to_usdt(side, base, fee, str(r.get("fee_currency","")), price)
 
-        total_quote += qv
-        total_fee_usdt += fee_usdt
+        # общий итог
+        total_quote_all += qv
+        total_fee_all   += fee_usdt
+
+        # групповые итоги
+        key = (ex, pair)
+        g = group_totals.get(key)
+        if not g:
+            g = {"q": Decimal("0"), "fee": Decimal("0")}
+            group_totals[key] = g
+        g["q"]   += qv
+        g["fee"] += fee_usdt
 
         wr.writerow([
-            r["ts"], r["ts_iso"], r.get("exchange","gate"), r["pair"], side,
+            r["ts"], r["ts_iso"], ex, pair, side,
             str(price), str(amount), str(qv),
             str(fee), r.get("fee_currency",""), r["id"]
         ])
 
-    net = total_quote - total_fee_usdt
-    # Итоговая строка (оставляем формат как был; поле exchange агрегируем как ALL)
+    # M5: Итоговые строки по каждой (exchange, pair)
+    # Стабильный порядок: сортируем по exchange, затем pair
+    for (ex, pair) in sorted(group_totals.keys(), key=lambda k: (k[0], k[1])):
+        g = group_totals[(ex, pair)]
+        net_g = g["q"] - g["fee"]
+        wr.writerow([
+            "TOTAL", "", ex, pair,
+            "NET", "", str(net_g),
+            str(g["fee"]), "USDT", ""
+        ])
+
+    # Общий итог (как раньше: exchange=ALL, pair=NET)
+    net_all = total_quote_all - total_fee_all
     wr.writerow([
         "TOTAL", "", "ALL", "NET",
-        "", "", str(net),
-        str(total_fee_usdt), "USDT", ""
+        "", "", str(net_all),
+        str(total_fee_all), "USDT", ""
     ])
 
     return buf.getvalue().encode("utf-8")
