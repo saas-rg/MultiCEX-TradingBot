@@ -1,5 +1,6 @@
 # webapp.py
 import os
+import time
 from decimal import Decimal
 from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -13,7 +14,9 @@ from core.params import (
 from core.reporting import (
     get_settings as get_report_settings,
     set_settings as set_report_settings,
-    send_report as send_report_now
+    send_report as send_report_now,
+    _align_period_end,
+    build_report_json,
 )
 from core.telemetry import send_event
 from config import ADMIN_TOKEN as CONF_ADMIN_TOKEN
@@ -268,6 +271,17 @@ def send_reporting_now():
     # уведомим, что вручную отправили отчёт
     send_event("manual_report", "Отчёт отправлен вручную из админки")
     return {"ok": True, "sent": bool(ok)}
+
+# ========== Reporting summary (JSON для админки/дашборда) ==========
+@app.get("/reporting/summary", dependencies=[Depends(require_admin)])
+def get_reporting_summary():
+    enabled, period_min = get_report_settings()
+    now = int(time.time())
+    end_ts = _align_period_end(now, period_min)
+    data = build_report_json(period_min, end_ts)
+    # добавим флаги для удобства фронта
+    data["enabled"] = enabled
+    return data
 
 # ========== Admin UI ==========
 @app.get("/admin", response_class=HTMLResponse)

@@ -401,6 +401,91 @@ def build_report_csv(period_min: int, ref_end_ts: int) -> bytes:
 
     return buf.getvalue().encode("utf-8")
 
+# ========== Структурированный JSON-отчёт (для /reporting) ==========
+def build_report_json(period_min: int, ref_end_ts: int) -> Dict[str, Any]:
+    """
+    Возвращает структурированный отчёт:
+    {
+      "period_min": 5,
+      "bounds": {"sell": {"start":..,"end":..}, "buy": {"start":..,"end":..}},
+      "paused": false,
+      "pairs_total": 3,
+      "pairs_active": 2,
+      "groups": [
+        {"exchange":"gate","pair":"EDGE_USDT","quote": "0.1916","fee_usdt":"0.0084","net":"0.1832"},
+        ...
+      ],
+      "total": {"quote":"...","fee_usdt":"...","net":"..."}
+    }
+    """
+    from decimal import Decimal  # локальный импорт для ясности
+    paused = get_paused()
+    pairs = list_pairs(include_disabled=True)
+
+    S, E = _period_bounds_by_end(ref_end_ts, period_min)
+    (buy_s, buy_e), (sell_s, sell_e) = _buy_sell_windows(S, E)
+
+    rows = _collect_trades_for_pairs(pairs, (buy_s, buy_e), (sell_s, sell_e))
+
+    total_quote_all = Decimal("0")
+    total_fee_all   = Decimal("0")
+    group_totals: Dict[Tuple[str, str], Dict[str, Decimal]] = {}
+
+    for r in rows:
+        price  = Decimal(str(r["price"]))
+        amount = Decimal(str(r["amount"]))
+        fee    = Decimal(str(r.get("fee","0")))
+        base   = str(r.get("base",""))
+        side   = r["side"]
+        ex     = str(r.get("exchange","gate"))
+        pair   = str(r["pair"])
+
+        qv = (amount * price)
+        if side == "BUY":
+            qv = -qv
+        fee_usdt = _fee_to_usdt(side, base, fee, str(r.get("fee_currency","")), price)
+
+        total_quote_all += qv
+        total_fee_all   += fee_usdt
+
+        key = (ex, pair)
+        g = group_totals.get(key)
+        if not g:
+            g = {"q": Decimal("0"), "fee": Decimal("0")}
+            group_totals[key] = g
+        g["q"]   += qv
+        g["fee"] += fee_usdt
+
+    groups_out: List[Dict[str, Any]] = []
+    for (ex, pair) in sorted(group_totals.keys(), key=lambda k: (k[0], k[1])):
+        g = group_totals[(ex, pair)]
+        net_g = g["q"] - g["fee"]
+        groups_out.append({
+            "exchange": ex,
+            "pair": pair,
+            "quote": str(g["q"]),
+            "fee_usdt": str(g["fee"]),
+            "net": str(net_g),
+        })
+
+    net_all = total_quote_all - total_fee_all
+    return {
+        "period_min": period_min,
+        "bounds": {
+            "sell": {"start": sell_s, "end": sell_e},
+            "buy":  {"start": buy_s,  "end": buy_e},
+        },
+        "paused": paused,
+        "pairs_total": len(pairs),
+        "pairs_active": sum(1 for p in pairs if p.get("enabled")),
+        "groups": groups_out,
+        "total": {
+            "quote": str(total_quote_all),
+            "fee_usdt": str(total_fee_all),
+            "net": str(net_all),
+        },
+    }
+
 # ========== Отправка/тик ==========
 def _get_last_period_end_ts() -> int:
     v = _rt_get(RUNTIME_KEY_LAST_END_TS)
