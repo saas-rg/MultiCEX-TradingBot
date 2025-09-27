@@ -2,6 +2,7 @@
 from __future__ import annotations
 import os, json, time, requests
 from typing import Any, Dict, Optional
+from html import escape as _html_escape
 
 TELEMETRY_ENABLED = os.getenv("TELEMETRY_ENABLED", "true").lower() in ("1","true","yes","y")
 TG_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
@@ -59,21 +60,38 @@ _EMOJI = {
     "manual_report":    "📤",
 
     # heartbeat / alerts
-    "heartbeat":     "💓",
-    "alert_silence": "🚨",
+    "heartbeat":        "💓",
+    "alert_silence":    "🚨",
+
+    # strategy alerts (новые)
+    "auto_resize_buy":  "📉",
+    "min_quote_guard":  "⚠️",
 }
+
+def _escape_html_block(s: str) -> str:
+    # Безопасно экранируем &, <, > и оставляем переносы строк
+    return _html_escape(s, quote=False)
 
 def send_event(event: str, msg: str, extra: Optional[Dict[str, Any]] = None) -> None:
     ts = int(time.time())
     prefix = _EMOJI.get(event, "ℹ️")
-    header = f"{prefix} <b>{APP_NAME}</b> [{ENV_NAME}] — <code>{event}</code>"
+    # Экранируем переменные части для HTML
+    app_html = _escape_html_block(APP_NAME)
+    env_html = _escape_html_block(ENV_NAME)
+    event_html = _escape_html_block(event)
+    msg_html = _escape_html_block(msg)
+
+    header = f"{prefix} <b>{app_html}</b> [{env_html}] — <code>{event_html}</code>"
     tail = ""
     if extra:
         try:
-            tail = "\n<pre>" + json.dumps(extra, ensure_ascii=False, indent=2) + "</pre>"
+            # Преобразуем extra в pretty JSON и экранируем
+            extra_json = json.dumps(extra, ensure_ascii=False, indent=2)
+            tail = "\n<pre>" + _escape_html_block(extra_json) + "</pre>"
         except Exception:
             pass
-    _tg_send(f"{header}\n{msg}\n🕒 <code>{ts}</code>{tail}")
+
+    _tg_send(f"{header}\n{msg_html}\n🕒 <code>{ts}</code>{tail}")
 
 def send_document(filename: str, data: bytes, caption: Optional[str] = None) -> bool:
     return _tg_send_document(filename, data, caption)

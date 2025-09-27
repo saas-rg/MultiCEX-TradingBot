@@ -5,13 +5,10 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="c3ee8f88-be4a-45e9-8594-811829f292cf" name="Changes" comment="">
-      <change beforePath="$PROJECT_DIR$/.env.example" beforeDir="false" afterPath="$PROJECT_DIR$/.env.example" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/config.py" beforeDir="false" afterPath="$PROJECT_DIR$/config.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/core/adapters/htx.py" beforeDir="false" afterPath="$PROJECT_DIR$/core/adapters/htx.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/core/params.py" beforeDir="false" afterPath="$PROJECT_DIR$/core/params.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/requirements.txt" beforeDir="false" afterPath="$PROJECT_DIR$/requirements.txt" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/webapp.py" beforeDir="false" afterPath="$PROJECT_DIR$/webapp.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/core/drain.py" beforeDir="false" afterPath="$PROJECT_DIR$/core/drain.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/core/strategy.py" beforeDir="false" afterPath="$PROJECT_DIR$/core/strategy.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/core/telemetry.py" beforeDir="false" afterPath="$PROJECT_DIR$/core/telemetry.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
