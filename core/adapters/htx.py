@@ -14,7 +14,7 @@ import httpx
 
 from core.exchange_base import ExchangeAdapter
 from config import (
-    HTX_API_KEY, HTX_API_SECRET, HTX_ACCOUNT_TYPE,
+    get_exchange_cfg,
     REQ_TIMEOUT as HTTP_TIMEOUT,
 )
 
@@ -27,16 +27,15 @@ def _to_htx_symbol(pair: str) -> str:
 def _iso_utc_now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
 
-# === HTX Spot adapter ===
 
 class HTXAdapter(ExchangeAdapter):
     """
     Минимальный адаптер HTX Spot с интерфейсом, совместимым с GateV4Adapter.
-    Реализованы:
+    Реализованы методы:
       - get_server_time_epoch()
       - get_pair_rules(pair) -> (price_prec, amount_prec, min_base, min_quote)
-      - get_last_price(pair)  (по последней сделке)
-      - get_prev_minute_close(pair) (закрытие предыдущей 1m свечи)
+      - get_last_price(pair)
+      - get_prev_minute_close(pair)
       - place_limit_buy(pair, price, amount, account=None) -> order_id
       - market_sell(pair, amount_base, account=None) -> order_id
       - cancel_order(pair, order_id) -> None
@@ -44,17 +43,23 @@ class HTXAdapter(ExchangeAdapter):
       - list_open_orders(pair) -> List[dict]
       - get_order_detail(pair, order_id) -> Dict[str,Any]
       - get_available(asset) -> Decimal
-      - fetch_trades(pair, start_ts, end_ts, limit) -> List[dict]  (для отчётов)
+      - fetch_trades(pair, start_ts, end_ts, limit) -> List[dict]
     """
 
-    def __init__(self, config_ctx: Any):
-        self.api_key = (HTX_API_KEY or "").strip()
-        self.api_secret = (HTX_API_SECRET or "").strip()
-        self.account_type = (HTX_ACCOUNT_TYPE or "spot").strip().lower()
+    def __init__(self, _config_ctx: Any):
+        cfg = get_exchange_cfg("htx")
+        self.api_key: str = (cfg.get("api_key") or "").strip()
+        self.api_secret: str = (cfg.get("api_secret") or "").strip()
+        self.account_type: str = (cfg.get("account_type") or "spot").strip().lower()
 
-        # Официальный REST для spot
-        self.public_base = "https://api.huobi.pro"
-        self.private_base = "https://api.huobi.pro"
+        # Базовый REST-эндпоинт берём из конфигурации (поддержка переопределения через .env)
+        host = (cfg.get("host") or "https://api.huobi.pro").rstrip("/")
+        self.public_base = host
+        self.private_base = host
+
+        # Опциональный SDK (если huobi установлен и use_sdk=true)
+        self._use_sdk: bool = bool(cfg.get("use_sdk"))
+        self._sdk = cfg.get("sdk") if self._use_sdk else None  # dict: {"market","account","trade","host"} | SpotApi | None
 
         self._http = httpx.Client(timeout=HTTP_TIMEOUT)
         self._account_id: Optional[str] = None
@@ -70,7 +75,7 @@ class HTXAdapter(ExchangeAdapter):
         return {"Content-Type": "application/json"}
 
     def _sign_url(self, method: str, path: str, extra_params: Dict[str, Any]) -> str:
-        host = self.private_base.replace("https://", "")
+        host = self.private_base.replace("https://", "").replace("http://", "")
         params = {
             "AccessKeyId": self.api_key,
             "SignatureMethod": "HmacSHA256",
@@ -96,13 +101,13 @@ class HTXAdapter(ExchangeAdapter):
         data = (r.json() or {}).get("data") or []
         # выбираем первый spot с state=working
         for a in data:
-            if str(a.get("type","")).lower() == "spot" and str(a.get("state","")).lower() == "working":
+            if str(a.get("type", "")).lower() == "spot" and str(a.get("state", "")).lower() == "working":
                 self._account_id = str(a.get("id"))
                 break
         if not self._account_id:
             # fallback: любой working
             for a in data:
-                if str(a.get("state","")).lower() == "working":
+                if str(a.get("state", "")).lower() == "working":
                     self._account_id = str(a.get("id"))
                     break
         if not self._account_id:
@@ -117,43 +122,76 @@ class HTXAdapter(ExchangeAdapter):
         lst = ((r.json() or {}).get("data") or {}).get("list") or []
         out: Dict[str, Decimal] = {}
         for it in lst:
-            t = str(it.get("type",""))
-            if t not in ("trade","frozen"):
+            t = str(it.get("type", ""))
+            if t not in ("trade", "frozen"):
                 continue
-            cc = str(it.get("currency","")).upper()
-            bal = Decimal(str(it.get("balance","0")) or "0")
+            cc = str(it.get("currency", "")).upper()
+            bal = Decimal(str(it.get("balance", "0")) or "0")
             out[cc] = out.get(cc, Decimal("0")) + bal
         return out
 
     # ---- совместимый интерфейс ----
 
     def get_server_time_epoch(self) -> int:
-        # HTX имеет /v1/common/timestamp (ms). Можно не вызывать — достаточно локального времени.
+        # У HTX есть /v1/common/timestamp (ms), но нам достаточно локального времени
         return int(time.time())
 
     def get_pair_rules(self, pair: str) -> Tuple[int, int, Decimal, Decimal]:
         """
         Возвращает (price_precision, amount_precision, min_base, min_quote)
         """
-        sym = _to_htx_symbol(pair)
+        # Публичная справочная ручка
         url = f"{self.public_base}/v1/common/symbols"
         r = self._http.get(url)
         r.raise_for_status()
         arr = (r.json() or {}).get("data") or []
+        sym = _to_htx_symbol(pair)
         for it in arr:
-            if str(it.get("symbol","")).lower() == sym:
-                price_prec  = int(it.get("price-precision", 8))
+            if str(it.get("symbol", "")).lower() == sym:
+                price_prec = int(it.get("price-precision", 8))
                 amount_prec = int(it.get("amount-precision", 8))
-                min_base = Decimal(str(it.get("min-order-amt","0")) or "0")
-                min_quote = Decimal(str(it.get("min-order-value","0")) or "0")
+                min_base = Decimal(str(it.get("min-order-amt", "0")) or "0")
+                min_quote = Decimal(str(it.get("min-order-value", "0")) or "0")
                 return price_prec, amount_prec, min_base, min_quote
         raise RuntimeError(f"HTX: symbol not found {pair}")
 
+    def _sdk_get_last_price(self, pair: str) -> Optional[Decimal]:
+        """
+        Попытка получить последнюю цену через huobi SDK (если доступен).
+        Возвращает Decimal или None (если не удалось).
+        """
+        if not self._sdk:
+            return None
+        try:
+            market = self._sdk.get("market") if isinstance(self._sdk, dict) else None
+            if market is None:
+                return None
+            sym = _to_htx_symbol(pair)
+            res = market.get_trade(sym)
+            price = None
+            if hasattr(res, "data") and res.data:
+                d0 = res.data[0]
+                price = getattr(d0, "price", None) or (d0.get("price") if isinstance(d0, dict) else None)
+            elif isinstance(res, dict):
+                ticks = ((res.get("tick") or {}).get("data") or [])
+                if ticks:
+                    price = ticks[0].get("price")
+            if price is None:
+                return None
+            return Decimal(str(price))
+        except Exception:
+            return None
+
     def get_last_price(self, pair: str) -> Decimal:
         """
-        Последняя цена по последней сделке:
-        GET /market/trade?symbol=btcusdt
+        Последняя цена по последней сделке.
+        Сначала пробуем SDK (если доступен), затем REST:
+          GET /market/trade?symbol=btcusdt
         """
+        px = self._sdk_get_last_price(pair)
+        if px is not None:
+            return px
+
         sym = _to_htx_symbol(pair)
         url = f"{self.public_base}/market/trade"
         r = self._http.get(url, params={"symbol": sym})
@@ -164,11 +202,44 @@ class HTXAdapter(ExchangeAdapter):
             raise RuntimeError(f"HTX: no trade data for {pair}")
         return Decimal(str(ticks[0].get("price", "0")))
 
+    def _sdk_get_prev_minute_close(self, pair: str) -> Optional[Decimal]:
+        """
+        Попытка получить закрытие предыдущей 1m свечи через SDK (если доступен).
+        Возвращает Decimal или None.
+        """
+        if not self._sdk:
+            return None
+        try:
+            market = self._sdk.get("market") if isinstance(self._sdk, dict) else None
+            if market is None:
+                return None
+            sym = _to_htx_symbol(pair)
+            try:
+                from huobi.constant import CandlestickInterval  # type: ignore
+                kl = market.get_candlestick(sym, CandlestickInterval.MIN1, 2)
+                closes: List[Decimal] = []
+                for k in getattr(kl, "data", []) or (kl if isinstance(kl, list) else []):
+                    c = getattr(k, "close", None) or (k.get("close") if isinstance(k, dict) else None)
+                    if c is not None:
+                        closes.append(Decimal(str(c)))
+                if len(closes) >= 2:
+                    return closes[1]
+            except Exception:
+                return None
+        except Exception:
+            return None
+        return None
+
     def get_prev_minute_close(self, pair: str) -> Decimal:
         """
-        Закрытие ПРЕДЫДУЩЕЙ 1-мин свечи:
-        GET /market/history/kline?symbol=btcusdt&period=1min&size=2
+        Закрытие ПРЕДЫДУЩЕЙ 1-мин свечи.
+        Сначала пробуем SDK (если возможен), затем REST:
+          GET /market/history/kline?symbol=btcusdt&period=1min&size=2
         """
+        c = self._sdk_get_prev_minute_close(pair)
+        if c is not None:
+            return c
+
         sym = _to_htx_symbol(pair)
         url = f"{self.public_base}/market/history/kline"
         r = self._http.get(url, params={"symbol": sym, "period": "1min", "size": 2})
@@ -176,8 +247,7 @@ class HTXAdapter(ExchangeAdapter):
         data = (r.json() or {}).get("data") or []
         if len(data) < 2:
             raise RuntimeError(f"HTX: not enough klines for {pair}")
-        # data[0] — последняя закрытая, data[1] — предыдущая закрытая (по документации/порядку)
-        prev = data[1]
+        prev = data[1]  # предыдущая закрытая
         return Decimal(str(prev.get("close", "0")))
 
     def place_limit_buy(self, pair: str, price: str, amount: str, account: str | None = None) -> str:
@@ -199,7 +269,7 @@ class HTXAdapter(ExchangeAdapter):
         js = r.json() or {}
         if js.get("status") != "ok":
             raise RuntimeError(f"HTX place_limit_buy failed: {js}")
-        oid = str(js.get("data",""))
+        oid = str(js.get("data", ""))
         if not oid:
             raise RuntimeError(f"HTX place_limit_buy: empty order id: {js}")
         return oid
@@ -222,7 +292,7 @@ class HTXAdapter(ExchangeAdapter):
         js = r.json() or {}
         if js.get("status") != "ok":
             raise RuntimeError(f"HTX market_sell failed: {js}")
-        oid = str(js.get("data",""))
+        oid = str(js.get("data", ""))
         if not oid:
             raise RuntimeError(f"HTX market_sell: empty order id: {js}")
         return oid
@@ -264,16 +334,15 @@ class HTXAdapter(ExchangeAdapter):
         r = self._http.get(url, headers=self._auth_headers())
         r.raise_for_status()
         arr = (r.json() or {}).get("data") or []
-        # Нормализуем несколько ключей под наш общий вид
         out: List[Dict[str, Any]] = []
         for it in arr:
             out.append({
-                "id": str(it.get("id","")),
-                "status": str(it.get("state","")),
-                "price": str(it.get("price","0")),
-                "amount": str(it.get("amount","0")),
-                "filled": str(it.get("filled-amount", it.get("field-amount","0"))),
-                "type": str(it.get("type","")),  # buy-limit/sell-limit/...
+                "id": str(it.get("id", "")),
+                "status": str(it.get("state", "")),
+                "price": str(it.get("price", "0")),
+                "amount": str(it.get("amount", "0")),
+                "filled": str(it.get("filled-amount", it.get("field-amount", "0"))),
+                "type": str(it.get("type", "")),  # buy-limit/sell-limit/...
                 "create_time": int(it.get("created-at", 0)) // 1000,
             })
         return out
@@ -286,14 +355,13 @@ class HTXAdapter(ExchangeAdapter):
         r = self._http.get(url, headers=self._auth_headers())
         r.raise_for_status()
         data = (r.json() or {}).get("data") or {}
-        # Немного унифицируем поля
         return {
-            "id": str(data.get("id","")),
-            "status": str(data.get("state","")),
-            "price": str(data.get("price","0")),
-            "amount": str(data.get("amount","0")),
-            "filled": str(data.get("field-amount", data.get("filled-amount","0"))),
-            "type": str(data.get("type","")),
+            "id": str(data.get("id", "")),
+            "status": str(data.get("state", "")),
+            "price": str(data.get("price", "0")),
+            "amount": str(data.get("amount", "0")),
+            "filled": str(data.get("field-amount", data.get("filled-amount", "0"))),
+            "type": str(data.get("type", "")),
             "create_time": int(data.get("created-at", 0)) // 1000,
             "update_time": int(data.get("finished-at", 0)) // 1000,
         }
@@ -307,11 +375,11 @@ class HTXAdapter(ExchangeAdapter):
         r = self._http.get(url, headers=self._auth_headers())
         r.raise_for_status()
         lst = ((r.json() or {}).get("data") or {}).get("list") or []
-        asset = asset.upper()
+        asset_u = asset.upper()
         free = Decimal("0")
         for it in lst:
-            if str(it.get("currency","")).upper() == asset and str(it.get("type","")) == "trade":
-                free += Decimal(str(it.get("balance","0")) or "0")
+            if str(it.get("currency", "")).upper() == asset_u and str(it.get("type", "")) == "trade":
+                free += Decimal(str(it.get("balance", "0")) or "0")
         return free
 
     # ---- отчёты: свои сделки за интервал ----
@@ -337,12 +405,12 @@ class HTXAdapter(ExchangeAdapter):
         for it in arr:
             out.append({
                 "ts": int(it.get("created-at", 0)) // 1000,
-                "price": str(it.get("price","0")),
-                "amount": str(it.get("filled-amount", it.get("filled-qty","0"))),
-                "side": str(it.get("type","").split("-")[0]).lower(),  # buy/sell
-                "fee": str(it.get("filled-fees", it.get("fee","0"))),
-                "fee_currency": str(it.get("fee-currency", it.get("fee-currency-type","USDT"))).upper(),
-                "trade_id": str(it.get("id", it.get("trade-id",""))),
+                "price": str(it.get("price", "0")),
+                "amount": str(it.get("filled-amount", it.get("filled-qty", "0"))),
+                "side": str(it.get("type", "").split("-")[0]).lower(),  # buy/sell
+                "fee": str(it.get("filled-fees", it.get("fee", "0"))),
+                "fee_currency": str(it.get("fee-currency", it.get("fee-currency-type", "USDT"))).upper(),
+                "trade_id": str(it.get("id", it.get("trade-id", ""))),
             })
-        out.sort(key=lambda x: (x["ts"], x.get("trade_id","")))
+        out.sort(key=lambda x: (x["ts"], x.get("trade_id", "")))
         return out
