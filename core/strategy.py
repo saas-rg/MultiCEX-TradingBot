@@ -3,6 +3,7 @@ from decimal import Decimal, ROUND_DOWN
 from typing import Tuple
 import threading
 import concurrent.futures
+from concurrent.futures import ThreadPoolExecutor
 import time
 import traceback
 import logging
@@ -30,8 +31,13 @@ log = logging.getLogger(__name__)
 
 # --- антиспам автоуведомлений автоснижения BUY ---
 AUTO_RESIZE_COOLDOWN_SEC = 5 * 60  # 5 минут
-_auto_resize_last_ts: dict[str, float] = {}  # pair -> last send ts (epoch seconds)
+_auto_resize_last_ts: dict[tuple[str, str], float] = {}  # (exchange,pair) -> last send ts
 _auto_resize_lock = threading.Lock()         # потокобезопасность
+
+# --- антиспам: предупреждение о минималке (min_quote) ---
+MIN_QUOTE_COOLDOWN_SEC = 5 * 60  # 5 минут
+_min_quote_last_ts: dict[tuple[str, str], float] = {}  # (exchange,pair) -> last send ts
+_min_quote_lock = threading.Lock()
 
 
 def _compute_base_and_target(ad, pair: str, gap_mode: str, gap_switch_pct: Decimal, deviation_pct: Decimal) -> Tuple[Decimal, Decimal, Decimal, str]:
@@ -75,11 +81,39 @@ def _ensure_pair_rules(ad, exchange: str, pair: str):
 def _drain(pair: str, base_sym: str, aprec: int, min_base: Decimal, ad) -> None:
     """Совместимость: стараемся передать adapter, если реализация не принимает — вызываем как раньше."""
     try:
-        # новый путь (желательно, чтобы core.drain поддерживал adapter=...)
         drain_base_position(pair, base_sym, aprec, min_base, adapter=ad)  # type: ignore
     except TypeError:
-        # старая реализация без adapter
         drain_base_position(pair, base_sym, aprec, min_base)
+
+
+def _notify_min_quote(exchange: str, pair: str, notional: Decimal, min_quote: Decimal, quote_sym: str) -> None:
+    """
+    Отправляет в Telegram предупреждение о том, что заявка ниже минимальной (min_quote),
+    с антиспамом 5 минут на (exchange, pair).
+    """
+    now = time.time()
+    key = (exchange, pair)
+    with _min_quote_lock:
+        last_ts = _min_quote_last_ts.get(key, 0.0)
+        if (now - last_ts) < MIN_QUOTE_COOLDOWN_SEC:
+            # для отладки покажем, что сработал антиспам
+            remaining = int(MIN_QUOTE_COOLDOWN_SEC - (now - last_ts))
+            print(f"[{exchange}:{pair}] min_quote_guard suppressed by cooldown ({remaining}s left)")
+            return
+        _min_quote_last_ts[key] = now
+
+    msg = (
+        f"[{exchange}:{pair}] Заявка ниже минимальной величины биржи: "
+        f"notional≈{notional} < min_quote {min_quote} {quote_sym}. "
+        f"Совет: увеличьте QUOTE/LOT или пополните баланс."
+    )
+    # Явно логируем попытку — чтобы видеть, что дошли до отправки
+    print(f"[TG] send_event min_quote_guard → {msg}")
+    try:
+        send_event("min_quote_guard", msg)
+    except Exception as e:
+        # Больше не молчим — выводим причину
+        print(f"[TG] min_quote_guard send_event error: {e!r}")
 
 
 def _prepare_and_place(cfg: dict):
@@ -138,8 +172,7 @@ def _prepare_and_place(cfg: dict):
             amount_base = dquant(raw_amount, aprec)
             order_quote_value = (amount_base * target_price).quantize(Decimal("1e-18"), rounding=ROUND_DOWN)
 
-        # запомним исходный запрос до автокоррекции (для телеметрии)
-        requested_amount_base = amount_base
+        requested_amount_base = amount_base  # до автокоррекции
 
         # --- автокоррекция по доступному балансу ---
         max_affordable_quote = (avail_quote * FEE_BUFFER).quantize(Decimal("1e-18"), rounding=ROUND_DOWN)
@@ -147,7 +180,7 @@ def _prepare_and_place(cfg: dict):
             amount_base = dquant((max_affordable_quote / target_price).quantize(Decimal("1e-18"), rounding=ROUND_DOWN), aprec)
             order_quote_value = (amount_base * target_price).quantize(Decimal("1e-18"), rounding=ROUND_DOWN)
 
-        # --- проверка минимумов биржи (quote/base) ---
+        # --- проверка минимумов биржи ---
         if min_quote and order_quote_value < min_quote and target_price > 0:
             need_amount = (min_quote / target_price).quantize(Decimal("1e-18"), rounding=ROUND_DOWN)
             adj_amount = dquant(need_amount, aprec)
@@ -158,24 +191,24 @@ def _prepare_and_place(cfg: dict):
             amount_base = min_base
             order_quote_value = (amount_base * target_price).quantize(Decimal("1e-18"), rounding=ROUND_DOWN)
 
-        # повторный «стопор» по балансу на случай подъёма из-за минимумов
+        # повторный «стопор» по балансу
         if order_quote_value > max_affordable_quote and target_price > 0:
             amount_base = dquant((max_affordable_quote / target_price).quantize(Decimal("1e-18"), rounding=ROUND_DOWN), aprec)
             order_quote_value = (amount_base * target_price).quantize(Decimal("1e-18"), rounding=ROUND_DOWN)
 
-        # --- уведомление об автоснижении объёма (антиспам) ---
+        # --- уведомление об автоснижении ---
         if amount_base < requested_amount_base:
             try:
                 now = time.time()
+                key = (exchange, pair)
                 with _auto_resize_lock:
-                    last_ts = _auto_resize_last_ts.get(pair, 0.0)
+                    last_ts = _auto_resize_last_ts.get(key, 0.0)
                     ok_to_send = (now - last_ts) >= AUTO_RESIZE_COOLDOWN_SEC
-
                 if ok_to_send:
                     delta_pct = (requested_amount_base - amount_base) / requested_amount_base * Decimal(100) if requested_amount_base > 0 else Decimal(0)
-                    final_quote = order_quote_value  # уже посчитан выше
+                    final_quote = order_quote_value
                     msg = (
-                        f"[{exchange}:{pair}] Автокоррекция BUY из-за нехватки средств: "
+                        f"[{exchange}:{pair}] Автокоррекция BUY: "
                         f"{fmt(requested_amount_base, aprec)} → {fmt(amount_base, aprec)} "
                         f"(-{delta_pct.quantize(Decimal('1.00'))}%). "
                         f"Цена={fmt(target_price, pprec)}, notional≈{final_quote} {quote_sym}. "
@@ -184,12 +217,7 @@ def _prepare_and_place(cfg: dict):
                     log.warning(msg)
                     send_event("auto_resize_buy", msg)
                     with _auto_resize_lock:
-                        _auto_resize_last_ts[pair] = now
-                else:
-                    remaining = 0
-                    with _auto_resize_lock:
-                        remaining = int(max(0, AUTO_RESIZE_COOLDOWN_SEC - (now - _auto_resize_last_ts.get(pair, 0.0))))
-                    log.debug(f"[{exchange}:{pair}] auto_resize_buy suppressed by cooldown ({remaining}s left)")
+                        _auto_resize_last_ts[key] = now
             except Exception as _e:
                 log.debug("auto_resize_buy notify skipped: %r", _e)
 
@@ -199,6 +227,20 @@ def _prepare_and_place(cfg: dict):
     if amount_base <= Decimal(0):
         set_last_order_id(pair, None)
         return {"pair": pair, "ok": False, "error": "amount <= 0 (not enough quote balance)"}
+
+    # --- финальный гард по минималке биржи (notional < min_quote) ---
+    if min_quote and order_quote_value < min_quote:
+        set_last_order_id(pair, None)
+        print(
+            f"[{exchange}:{pair}] skip BUY: notional≈{order_quote_value} < min_quote {min_quote} — "
+            f"увеличьте QUOTE/LOT или освободите баланс"
+        )
+        # телеграм-оповещение (с антиспамом 5 минут)
+        try:
+            _notify_min_quote(exchange, pair, order_quote_value, min_quote, quote_sym)
+        except Exception:
+            pass
+        return {"pair": pair, "exchange": exchange, "ok": False, "error": "notional_below_min_quote"}
 
     try:
         oid = ad.place_limit_buy(
@@ -211,9 +253,24 @@ def _prepare_and_place(cfg: dict):
         print(f"[{exchange}:{pair}] BUY(limit) placed: id={oid}, amount={fmt(amount_base, aprec)}, quote≈{order_quote_value}, target={fmt(target_price, pprec)}")
         return {"pair": pair, "ok": True, "order_id": oid, "amount": amount_base, "price": target_price}
     except Exception as e:
+        emsg = str(e)
+        # Ожидаемые ошибки минималки (HTX/Gate) — пишем понятный лог без traceback
+        if ("order-value-min-error" in emsg) or ("too small" in emsg) or ("minimum is" in emsg) or ("minimum" in emsg):
+            set_last_order_id(pair, None)
+            print(
+                f"[{exchange}:{pair}] rejected by exchange min: notional≈{order_quote_value} < required min "
+                f"(min_quote {min_quote}). Tip: raise QUOTE/LOT."
+            )
+            # телеграм-оповещение (с антиспамом)
+            try:
+                _notify_min_quote(exchange, pair, order_quote_value, min_quote, quote_sym)
+            except Exception:
+                pass
+            return {"pair": pair, "exchange": exchange, "ok": False, "error": "exchange_min_notional"}
+        # Всё остальное — как раньше, с трассой
         traceback.print_exc()
         set_last_order_id(pair, None)
-        return {"pair": pair, "ok": False, "error": f"place_limit_buy error: {e}"}
+        return {"pair": pair, "exchange": exchange, "ok": False, "error": f"place_limit_buy error: {e}"}
 
 
 def _cleanup_pair(cfg: dict):
@@ -267,8 +324,10 @@ def trading_cycle():
 
     print(f"TESTNET={TESTNET} HOST={HOST} ACCOUNT={ACCOUNT_TYPE or 'default'}")
     print("Старт мультипарного параллельного цикла (с отчётами).")
-    # Инициализация heartbeat (проверка тишины на старте)
     heartbeat_init()
+
+    prev_enabled: dict[tuple[str, str], bool] = {}
+    _bg = ThreadPoolExecutor(max_workers=4, thread_name_prefix="disable-cleanup")
 
     while True:
         try:
@@ -279,9 +338,29 @@ def trading_cycle():
                 heartbeat_tick()
                 continue
 
-            pairs = list_pairs(include_disabled=False)
+            pairs_all = list_pairs(include_disabled=True)
+
+            # обработка перехода enabled: true -> false
+            for cfg in pairs_all:
+                exch = (cfg.get("exchange") or "gate").strip().lower()
+                pair = cfg["pair"]
+                en_now = bool(cfg.get("enabled", True))
+                key = (exch, pair)
+                # ВАЖНО: если записи ещё не было, считаем, что раньше было True — чтобы поймать первое выключение
+                en_prev = prev_enabled.get(key, True)
+                if en_prev and not en_now:
+                    def _disable_cleanup(_cfg=cfg, _exch=exch, _pair=pair):
+                        try:
+                            _ = _cleanup_pair(_cfg)
+                            print(f"[{_exch}:{_pair}] disabled → cancel_all + drain done")
+                        except Exception as e:
+                            print(f"[{_exch}:{_pair}] disable cleanup error: {e}")
+                    _bg.submit(_disable_cleanup)
+                prev_enabled[key] = en_now
+
+            pairs = [p for p in pairs_all if p.get("enabled")]
             if not pairs:
-                print("[CONFIG] Не задано ни одной активной пары. Сплю до следующей минуты.")
+                print("[CONFIG] Нет активных пар. Сплю до следующей минуты.")
                 sleep_until_next_minute()
                 reporting_tick()
                 heartbeat_tick()
@@ -291,13 +370,13 @@ def trading_cycle():
 
             # --- BUY лимитники ---
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
-                futs = { ex.submit(_prepare_and_place, cfg): cfg["pair"] for cfg in pairs }
+                futs = {ex.submit(_prepare_and_place, cfg): cfg["pair"] for cfg in pairs}
                 for fut in concurrent.futures.as_completed(futs):
                     pair = futs[fut]
                     try:
                         res = fut.result()
                         if not res.get("ok"):
-                            print(f"[{pair}] place error: {res.get('error')}")
+                            print(f"[{res.get('exchange','?')}:{pair}] place error: {res.get('error')}")
                     except Exception as e:
                         print(f"[{pair}] place fatal: {e}")
 
@@ -305,7 +384,7 @@ def trading_cycle():
 
             # --- cleanup/market-sell ---
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
-                futs = { ex.submit(_cleanup_pair, cfg): cfg["pair"] for cfg in pairs }
+                futs = {ex.submit(_cleanup_pair, cfg): cfg["pair"] for cfg in pairs}
                 for fut in concurrent.futures.as_completed(futs):
                     pair = futs[fut]
                     try:
@@ -313,7 +392,6 @@ def trading_cycle():
                     except Exception as e:
                         print(f"[{pair}] cleanup fatal: {e}")
 
-            # периодические сервисные тики
             reporting_tick()
             heartbeat_tick()
 
