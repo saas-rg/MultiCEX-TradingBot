@@ -2,9 +2,9 @@
 import os
 import time
 from decimal import Decimal
-from fastapi import FastAPI, HTTPException, Depends, Request
+from fastapi import FastAPI, HTTPException, Depends, Request, Body
 from fastapi.responses import HTMLResponse, JSONResponse
-from pydantic import BaseModel, Field, conlist
+from pydantic import BaseModel, Field
 from typing import Optional, Dict, Any, Literal, List, Tuple
 
 from core import exchange_proxy
@@ -12,8 +12,11 @@ import config as CONF
 
 from core.params import (
     load_overrides, upsert_params, get_paused, set_paused, ensure_schema,
-    list_pairs, upsert_pairs
+    list_pairs, upsert_pairs,
 )
+from core.params import delete_pair as _delete_pair  # ← для удаления строки из БД
+from core.exchange_ops import cancel_and_drain      # ← отмена ордеров + дренаж перед удалением
+
 from core.reporting import (
     get_settings as get_report_settings,
     set_settings as set_report_settings,
@@ -27,7 +30,7 @@ from core.db_migrate import run_all as run_db_migrations
 
 from core.exchange_proxy import available_exchanges
 
-app = FastAPI(title="CEX Trading Bot API", version="2.4.1")
+app = FastAPI(title="CEX Trading Bot API", version="2.5.0")
 
 # ========== Admin token handling ==========
 ADMIN_TOKEN = (CONF_ADMIN_TOKEN or os.getenv("ADMIN_TOKEN", "")).strip()
@@ -66,7 +69,6 @@ class PairItem(BaseModel):
     enabled: bool = True
 
 class PairsBody(BaseModel):
-    # было conlist(..., max_length=5) — убираем ограничение
     pairs: List[PairItem] = Field(default_factory=list)
 
 class PauseReq(BaseModel):
@@ -80,13 +82,12 @@ class ReportingBody(BaseModel):
 @app.on_event("startup")
 def _startup():
     ensure_schema()
-    # v0.7.3: идемпотентные миграции (bot_pairs.exchange)
+    # идемпотентные миграции (в т.ч. bot_pairs.exchange)
     try:
         run_db_migrations()
     except Exception as e:
-        # Не валим веб на миграции, просто лог
         print(f"[MIGRATE] Ошибка автомиграции: {e}")
-    # Мультибиржевой реестр + дефолтный адаптер Gate
+    # мультибиржевой реестр + дефолтный адаптер Gate
     exchange_proxy.init_adapter(CONF)
 
 # ========== Helpers for diffs ==========
@@ -99,7 +100,6 @@ def _norm_dec(v: Any) -> str:
 def _pair_to_view(p) -> Dict[str, str]:
     return {
         "idx": str(p.get("idx", "")),
-        # v0.7.2: показываем биржу (дефолт 'gate', чтобы не ломать старые записи)
         "exchange": str(p.get("exchange", "gate")),
         "pair": str(p.get("pair", "")),
         "deviation_pct": _norm_dec(p.get("deviation_pct", "")),
@@ -115,7 +115,8 @@ def _pairs_map(arr: List[Dict[str, Any]]) -> Dict[str, Dict[str, str]]:
     for x in arr:
         v = _pair_to_view(x)
         if v["pair"]:
-            m[v["pair"]] = v
+            # ключом делаем (exchange+pair), чтобы различать одинаковые пары на разных биржах
+            m[f"{v['exchange']}::{v['pair']}"] = v
     return m
 
 def _diff_pairs(old: Dict[str, Dict[str, str]], new: Dict[str, Dict[str, str]]) -> Tuple[List[str], List[str], List[str]]:
@@ -125,10 +126,14 @@ def _diff_pairs(old: Dict[str, Dict[str, str]], new: Dict[str, Dict[str, str]]) 
     for k in sorted(keys):
         if k not in old:
             v = new.get(k, {})
-            added.append(f"+ <code>{k}</code> DEV={v.get('deviation_pct','')} QUOTE={v.get('quote','')} LOT={v.get('lot_size_base','')} {v.get('gap_mode','')}/{v.get('gap_switch_pct','')} EN={v.get('enabled','')}")
+            added.append(f"+ <code>[{v.get('exchange','gate')}:{v.get('pair','?')}]</code> "
+                         f"DEV={v.get('deviation_pct','')} QUOTE={v.get('quote','')} LOT={v.get('lot_size_base','')} "
+                         f"{v.get('gap_mode','')}/{v.get('gap_switch_pct','')} EN={v.get('enabled','')}")
         elif k not in new:
             v = old.get(k, {})
-            removed.append(f"− <code>{k}</code> (была: DEV={v.get('deviation_pct','')} QUOTE={v.get('quote','')} LOT={v.get('lot_size_base','')} {v.get('gap_mode','')}/{v.get('gap_switch_pct','')} EN={v.get('enabled','')})")
+            removed.append(f"− <code>[{v.get('exchange','gate')}:{v.get('pair','?')}]</code> "
+                           f"(было: DEV={v.get('deviation_pct','')} QUOTE={v.get('quote','')} LOT={v.get('lot_size_base','')} "
+                           f"{v.get('gap_mode','')}/{v.get('gap_switch_pct','')} EN={v.get('enabled','')})")
         else:
             o, n = old[k], new[k]
             diffs = []
@@ -136,7 +141,8 @@ def _diff_pairs(old: Dict[str, Dict[str, str]], new: Dict[str, Dict[str, str]]) 
                 if o.get(f) != n.get(f):
                     diffs.append(f"{f.upper()} {o.get(f)}→{n.get(f)}")
             if diffs:
-                changed.append(f"• <code>{k}</code>: " + "; ".join(diffs))
+                ex, pr = n.get("exchange","gate"), n.get("pair","?")
+                changed.append(f"• <code>[{ex}:{pr}]</code>: " + "; ".join(diffs))
     return added, removed, changed
 
 def _diff_params(old: Dict[str, Any], new: Dict[str, Any]) -> List[str]:
@@ -163,14 +169,13 @@ def root():
 def status():
     p = load_overrides()
     rep_enabled, rep_period = get_report_settings()
-    # v0.7.2: добавим состояния по парам (с биржей), не ломая старое поле params
     pairs_view = [_pair_to_view(x) for x in list_pairs(include_disabled=True)]
     return {
         "status": "ok",
         "paused": get_paused(),
         "params": {k: str(v) for k, v in p.items()},
         "reporting": {"enabled": rep_enabled, "period_min": rep_period},
-        "pairs": pairs_view,  # <-- добавлено
+        "pairs": pairs_view,
     }
 
 @app.get("/params", dependencies=[Depends(require_admin)])
@@ -183,7 +188,6 @@ def put_params(body: ParamsUpdate):
     upd: Dict[str, Any] = {k: v for k, v in body.model_dump(exclude_none=True).items()}
     after = upsert_params(upd)
 
-    # Телеграм-уведомление, только если есть реальные изменения
     diffs = _diff_params(before, after)
     if diffs:
         send_event("params_update", "<b>Изменены глобальные параметры</b>\n" + "\n".join(diffs))
@@ -221,7 +225,6 @@ def put_pairs(body: PairsBody):
     after_arr = upsert_pairs(arr)
     after_map = _pairs_map(after_arr)
 
-    # Телеграм-уведомление об изменениях по парам
     added, removed, changed = _diff_pairs(before_map, after_map)
     if added or removed or changed:
         lines = ["<b>Обновлены торговые пары</b>"]
@@ -234,6 +237,41 @@ def put_pairs(body: PairsBody):
         send_event("pairs_update", "\n\n".join(lines))
 
     return {"ok": True, "pairs": [_pair_to_view(x) for x in after_arr]}
+
+@app.delete("/pairs", dependencies=[Depends(require_admin)])
+def delete_pair_ep(payload: Dict[str, Any] = Body(...)):
+    """
+    Удаляет пару из конфигурации:
+    {
+      "exchange": "htx",     // обязательно
+      "pair": "CTXC_USDT"    // обязательно
+    }
+    Перед удалением: отменит открытые лимитники и выполнит финальный дренаж.
+    """
+    exch = str(payload.get("exchange", "")).strip().lower()
+    pair = str(payload.get("pair", "")).strip().upper()
+    if not exch or not pair or "_" not in pair:
+        raise HTTPException(status_code=400, detail="Invalid payload: require {exchange, pair}")
+
+    # 1) Очистка на бирже (best-effort)
+    try:
+        cancel_and_drain(exch, pair)
+    except Exception as e:
+        print(f"[{exch}:{pair}] delete_pair cleanup warning: {e}")
+
+    # 2) Удаление из БД
+    ok = _delete_pair(exch, pair)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Pair not found")
+
+    # 3) Телеметрия
+    try:
+        send_event("pairs_update", f"<b>Удалена пара</b>\n− <code>[{exch}:{pair}]</code>")
+    except Exception:
+        pass
+
+    # 4) Вернём свежий список
+    return {"ok": True, "pairs": [_pair_to_view(x) for x in list_pairs(include_disabled=True)]}
 
 # ========== Pause control ==========
 @app.post("/control/pause", dependencies=[Depends(require_admin)])
@@ -259,7 +297,6 @@ def put_reporting(body: ReportingBody):
     old_enabled, old_period = get_report_settings()
     enabled, period_min = set_report_settings(body.enabled, body.period_min)
 
-    # Телеграм-уведомление при изменении настроек отчётов
     diffs = []
     if enabled != old_enabled:
         diffs.append(f"ENABLED {str(old_enabled).lower()}→{str(enabled).lower()}")
@@ -273,7 +310,6 @@ def put_reporting(body: ReportingBody):
 @app.post("/reporting/send", dependencies=[Depends(require_admin)])
 def send_reporting_now():
     ok = send_report_now(force=True)
-    # уведомим, что вручную отправили отчёт
     send_event("manual_report", "Отчёт отправлен вручную из админки")
     return {"ok": True, "sent": bool(ok)}
 
@@ -284,7 +320,6 @@ def get_reporting_summary():
     now = int(time.time())
     end_ts = _align_period_end(now, period_min)
     data = build_report_json(period_min, end_ts)
-    # добавим флаги для удобства фронта
     data["enabled"] = enabled
     return data
 
@@ -293,7 +328,7 @@ def get_reporting_summary():
 def admin_ui():
     return HTML_PAGE
 
-# --- HTML (минимальные правки: колонка Exchange editable; unlimited rows) ---
+# --- HTML/JS: добавлена колонка "ACTIONS" с кнопкой удаления строки ---
 HTML_PAGE = """<!doctype html>
 <html lang="ru"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
 <title>CEX Trading Bot — Admin</title>
@@ -315,6 +350,7 @@ button{border:0;border-radius:10px;padding:10px 14px;font-weight:600;cursor:poin
 .ghost{background:#0b1220;color:var(--text);border:1px solid #334155}
 .warn{background:#1f2937;color:#fde68a;border:1px solid #6b7280}
 .ok{background:#052e1a;color:#bbf7d0;border:1px solid #14532d}
+.danger{background:#2a0f0f;color:#fecaca;border:1px solid #7f1d1d}
 table{width:100%;border-collapse:separate;border-spacing:0 10px}
 th,td{padding:8px 10px}
 th{color:#9ca3af;font-weight:600;text-align:left}
@@ -343,7 +379,7 @@ label{font-size:13px;color:#cbd5e1;margin-right:8px}
 <div style="height:12px"></div>
 
 <table id="pairs"><thead><tr>
-  <th>#</th><th>Exchange</th><th>PAIR</th><th>DEV %</th><th>QUOTE</th><th>LOT BASE</th><th>GAP MODE</th><th>GAP %</th><th>ENABLED</th>
+  <th>#</th><th>Exchange</th><th>PAIR</th><th>DEV %</th><th>QUOTE</th><th>LOT BASE</th><th>GAP MODE</th><th>GAP %</th><th>ENABLED</th><th>ACTIONS</th>
 </tr></thead><tbody></tbody></table>
 
 <div class="small">Hint: [QUOTE] is ignored if [LOT BASE] &gt; 0</div>
@@ -398,7 +434,6 @@ function setBadge(paused){ const dot=document.getElementById('status-dot'); cons
   else { dot.className='status-dot dot-off'; label.textContent='Статус: неизвестно'; }
 }
 
-// список доступных бирж (подстрахуем дефолтом)
 let EXCHANGES = ['gate'];
 
 function exchangeSelect(current){
@@ -446,8 +481,8 @@ function addRow(row){
         <option value="true" ${en!=='false'?'selected':''}>true</option>
         <option value="false" ${en==='false'?'selected':''}>false</option>
       </select>
-    </td>`;
-  // вставляем выпадающий список бирж в 2-ю колонку
+    </td>
+    <td><button class="danger" title="Удалить пару" onclick="onDeleteClick(this)">🗑</button></td>`;
   tr.children[1].appendChild(exchangeSelect(ex));
 
   tbody.appendChild(tr);
@@ -457,29 +492,29 @@ async function reload(){
   try{
     const tbody = document.querySelector('#pairs tbody'); tbody.innerHTML='';
 
-    // 1) получить пары
+    // 1) пары
     const s = await fetch('/pairs', { headers: authHeaders() });
     if (s.status===401){ toast('Неверный пароль (401). Нажмите «Ввести/сменить пароль».', false); return; }
     const data = await s.json();
     const arr = (data.pairs || []);
 
-    // 2) получить список бирж (для select)
+    // 2) биржи
     try{
       const r = await fetch('/api/exchanges', { headers: authHeaders() });
       if (r.ok){
         const js = await r.json();
         if (Array.isArray(js.exchanges) && js.exchanges.length) EXCHANGES = js.exchanges;
       }
-    }catch(_e){ /* fallback: EXCHANGES=['gate'] */ }
+    }catch(_e){}
 
-    // 3) отрисовать все строки (если пусто — одну пустую)
+    // 3) отрисовка
     if (arr.length === 0){
       addRow({exchange:'gate'});
     } else {
       arr.forEach(row => addRow(row));
     }
 
-    // 4) подтянуть статус/репортинг
+    // 4) статус/репортинг
     const stat = await fetch('/status', { headers: authHeaders() });
     if (stat.ok){
       const js = await stat.json();
@@ -504,7 +539,7 @@ async function save(){
     const gm  = tr.children[6].querySelector('select').value.trim();
     const gp  = tr.children[7].querySelector('input').value.trim();
     const en  = tr.children[8].querySelector('select').value.trim();
-    if (!p) continue; // пустые строки не отправляем
+    if (!p) continue;
     body.pairs.push({
       exchange: ex || 'gate',
       pair: p,
@@ -523,6 +558,32 @@ async function save(){
     if (!res.ok || data.ok===false){ throw new Error(data.detail||JSON.stringify(data)); }
     toast('Пары сохранены'); reload();
   }catch(e){ toast('Ошибка сохранения: '+e.message, false); }
+}
+
+async function apiDeletePair(ex, pair){
+  if (!ex || !pair){ toast('Пустая строка удаляется через «Сохранить пары»', false); return; }
+  if (!confirm(`Удалить пару [${ex}:${pair}]? Будут отменены ордера и выполнен дренаж.`)) return;
+  try{
+    const r = await fetch('/pairs', { method:'DELETE', headers:Object.assign({"Content-Type":"application/json"}, authHeaders()), body: JSON.stringify({exchange: ex, pair}) });
+    const js = await r.json();
+    if (r.status===401){ toast('Неверный пароль (401).', false); return; }
+    if (!r.ok || js.ok===false){ throw new Error(js.detail || JSON.stringify(js)); }
+    toast(`Удалено: [${ex}:${pair}]`);
+    reload();
+  }catch(e){ toast('Ошибка удаления: '+e.message, false); }
+}
+
+function onDeleteClick(btn){
+  const tr = btn.closest('tr');
+  const ex  = tr.children[1].querySelector('select').value;
+  const p   = tr.children[2].querySelector('input').value.trim().toUpperCase();
+  if (!p){
+    // пустую локальную строку — просто удалить из DOM (не отправляя на сервер)
+    tr.remove();
+    toast('Строка удалена локально. Нажмите «Сохранить пары».');
+    return;
+  }
+  apiDeletePair(ex, p);
 }
 
 async function setPause(flag){
