@@ -1,6 +1,7 @@
-# --- PyCharm/IDEA ---
+# --- PyCharm/IDEA(IDE) ---
 .idea/
 *.iml
+.vscode/
 
 # --- Python ---
 __pycache__/
@@ -8,6 +9,13 @@ __pycache__/
 *.pyo
 *.pyd
 *.pkl
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+.venv/
+venv/
+env/
 
 # --- Virtualenv ---
 .venv/
@@ -24,3 +32,14 @@ Thumbs.db
 *.sqlite
 *.sqlite3
 logs/
+
+# Secrets & local configs
+.env
+*.local.json
+
+# App data & outputs
+data/
+*.csv
+
+# Node (на будущее)
+node_modules/
