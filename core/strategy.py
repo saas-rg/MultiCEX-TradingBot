@@ -15,7 +15,7 @@ from core.quant import dquant, fmt
 from core.drain import drain_base_position
 from core.sync import sleep_until_next_minute
 from core.state import set_last_order_id, get_last_order_id
-from core.params import list_pairs, get_paused
+from core.params import list_pairs, get_paused, get_shutdown, set_shutdown
 from core.reporting import tick as reporting_tick
 from core.heartbeat import tick as heartbeat_tick, init as heartbeat_init
 from core.telemetry import send_event
@@ -331,6 +331,26 @@ def trading_cycle():
 
     while True:
         try:
+            # --- полная остановка по сигналу админки ---
+            if get_shutdown():
+                print("[STOP] Stop requested by admin. Cancelling all orders and draining...")
+                pairs_all = list_pairs(include_disabled=True)
+                max_workers = min(16, max(1, len(pairs_all) * 2))
+                with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+                    futs = {ex.submit(_cleanup_pair, cfg): cfg["pair"] for cfg in pairs_all}
+                    for fut in concurrent.futures.as_completed(futs):
+                        try:
+                            _ = fut.result()
+                        except Exception:
+                            pass
+                try:
+                    send_event("worker_stop",
+                               "Остановлен админом: выполнены cancel_all и финальный дренаж по всем парам.")
+                except Exception:
+                    pass
+                    # Выходим из trading_cycle, чтобы runner ушёл в standby и ждал «Запустить»
+                return
+
             if get_paused():
                 print("[PAUSE] Paused by control flag. Sleeping until next minute...")
                 sleep_until_next_minute()

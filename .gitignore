@@ -1,27 +1,41 @@
-# Python
+# --- IDE/venv ---
+.idea/
+.venv/
+venv/
+ENV/
+env/
+
+# --- Secrets & local configs ---
+.env
+.env.*
+*.env
+*.local.json
+*.secret.json
+
+# --- Local DB / logs ---
+.data/
+*.db
+*.sqlite
+*.sqlite3
+logs/
+
+# --- Project local dirs you don't want in Git ---
+scripts/
+
+# --- Python ---
 __pycache__/
 *.py[cod]
 *.pyo
 *.pyd
 *.egg-info/
-.venv/
-venv/
-env/
 
-# IDE
-.idea/
-.vscode/
+# --- OS junk ---
+.DS_Store
+Thumbs.db
 
-# Secrets & local configs
-.env
-*.local.json
-
-# App data & outputs
-logs/
+# --- App data & outputs ---
 data/
-*.sqlite
-*.db
 *.csv
 
-# Node (на будущее)
+# --- Node (на будущее) ---
 node_modules/

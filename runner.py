@@ -1,12 +1,15 @@
 # runner.py
 import signal
 import sys
+import time
+
 from core.params import list_pairs, ensure_schema
 from core.strategy import trading_cycle
 from core import exchange_proxy
 from core.telemetry import send_event
 from core.db_migrate import run_all as run_db_migrations
 from core.exchange_proxy import get_adapter
+from core.params import get_shutdown
 
 def _cancel_all_pairs_orders():
     try:
@@ -36,24 +39,42 @@ def _handle_signal(signum, frame):
 
 def main():
     ensure_schema()
-    # v0.7.3: идемпотентные миграции (bot_pairs.exchange)
     try:
         run_db_migrations()
     except Exception as e:
         print(f"[MIGRATE] Ошибка автомиграции: {e}")
 
-    # Инициализация адаптера биржи по корневому config.py (Gate по умолчанию)
-    import config  # важно: из корня проекта
-    exchange_proxy.init_adapter(config)  # настраивает также мульти-реестр
+    # НЕ сбрасываем shutdown здесь — это делает кнопка «Запустить» в админке
+    import config
+    exchange_proxy.init_adapter(config)
 
-    # Реконсиляция перед стартом + телеметрия
-    try:
-        _cancel_all_pairs_orders()
-    except Exception:
-        pass
-    send_event("worker_start", "Воркер запущен и готов к торговому циклу.")
+    # Надзорный (supervisor) цикл: процесс живёт всегда,
+    # при shutdown=true — ждёт команды запуска, при false — крутит торговый цикл.
+    while True:
+        try:
+            if get_shutdown():
+                print("[STANDBY] shutdown=true — ждём команду «Запустить» из админки…")
+                time.sleep(2)
+                continue
 
-    trading_cycle()
+            # Реконсиляция перед стартом + телеметрия
+            try:
+                _cancel_all_pairs_orders()
+            except Exception:
+                pass
+            send_event("worker_start", "Воркер запущен и готов к торговому циклу.")
+
+            # Вернёмся сюда, когда trading_cycle() завершится по стопу
+            trading_cycle()
+            # После return из trading_cycle() цикл while продолжится:
+            # если в БД стоит shutdown=true — войдём в standby, если false — перезапустим торговлю.
+
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:
+            print(f"[SUPERVISOR] trading_cycle crashed: {e}")
+            time.sleep(2)
+            continue
 
 if __name__ == "__main__":
     signal.signal(signal.SIGINT, _handle_signal)

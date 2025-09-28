@@ -15,6 +15,7 @@ from core.params import (
     list_pairs, upsert_pairs,
 )
 from core.params import delete_pair as _delete_pair  # ← для удаления строки из БД
+from core.params import set_shutdown, get_shutdown
 from core.exchange_ops import cancel_and_drain      # ← отмена ордеров + дренаж перед удалением
 
 from core.reporting import (
@@ -29,8 +30,9 @@ from config import ADMIN_TOKEN as CONF_ADMIN_TOKEN
 from core.db_migrate import run_all as run_db_migrations
 
 from core.exchange_proxy import available_exchanges
+from core.heartbeat import get_last_ping_ts
 
-app = FastAPI(title="CEX Trading Bot API", version="2.5.0")
+app = FastAPI(title="CEX Trading Bot API", version="2.6.0")
 
 # ========== Admin token handling ==========
 ADMIN_TOKEN = (CONF_ADMIN_TOKEN or os.getenv("ADMIN_TOKEN", "")).strip()
@@ -74,6 +76,12 @@ class PairsBody(BaseModel):
 class PauseReq(BaseModel):
     paused: bool
 
+class StopReq(BaseModel):
+    confirm: bool = Field(..., description="Требуется true для подтверждения остановки")
+
+class StartReq(BaseModel):
+    confirm: bool = Field(..., description="Требуется true для подтверждения запуска (снятие shutdown+pause)")
+
 class ReportingBody(BaseModel):
     enabled: bool
     period_min: int = Field(..., description="Один из {1,5,10,15,30,60}")
@@ -115,7 +123,6 @@ def _pairs_map(arr: List[Dict[str, Any]]) -> Dict[str, Dict[str, str]]:
     for x in arr:
         v = _pair_to_view(x)
         if v["pair"]:
-            # ключом делаем (exchange+pair), чтобы различать одинаковые пары на разных биржах
             m[f"{v['exchange']}::{v['pair']}"] = v
     return m
 
@@ -163,16 +170,32 @@ def _diff_params(old: Dict[str, Any], new: Dict[str, Any]) -> List[str]:
 # ========== Basic endpoints ==========
 @app.get("/", response_class=JSONResponse)
 def root():
-    return {"status": "ok", "service": "cex-trading-bot", "role": "web", "paused": get_paused()}
+    return {
+        "status": "ok",
+        "service": "cex-trading-bot",
+        "role": "web",
+        "paused": get_paused(),
+        "shutdown": get_shutdown(),
+    }
 
 @app.get("/status", dependencies=[Depends(require_admin)])
 def status():
     p = load_overrides()
     rep_enabled, rep_period = get_report_settings()
     pairs_view = [_pair_to_view(x) for x in list_pairs(include_disabled=True)]
+
+    # online-статус по быстрым пингам
+    now = int(time.time())
+    last_ping = get_last_ping_ts() or 0
+    ping_age = now - last_ping if last_ping > 0 else 10**9
+    alive = ping_age <= 15  # 3 * 5 сек (можете сделать настраиваемым)
+
     return {
         "status": "ok",
         "paused": get_paused(),
+        "shutdown": get_shutdown(),
+        "alive": alive,
+        "last_ping_age_sec": ping_age,
         "params": {k: str(v) for k, v in p.items()},
         "reporting": {"enabled": rep_enabled, "period_min": rep_period},
         "pairs": pairs_view,
@@ -242,10 +265,7 @@ def put_pairs(body: PairsBody):
 def delete_pair_ep(payload: Dict[str, Any] = Body(...)):
     """
     Удаляет пару из конфигурации:
-    {
-      "exchange": "htx",     // обязательно
-      "pair": "CTXC_USDT"    // обязательно
-    }
+    { "exchange": "htx", "pair": "CTXC_USDT" }
     Перед удалением: отменит открытые лимитники и выполнит финальный дренаж.
     """
     exch = str(payload.get("exchange", "")).strip().lower()
@@ -273,7 +293,7 @@ def delete_pair_ep(payload: Dict[str, Any] = Body(...)):
     # 4) Вернём свежий список
     return {"ok": True, "pairs": [_pair_to_view(x) for x in list_pairs(include_disabled=True)]}
 
-# ========== Pause control ==========
+# ========== Pause/Stop/Start control ==========
 @app.post("/control/pause", dependencies=[Depends(require_admin)])
 def pause(body: PauseReq):
     set_paused(body.paused)
@@ -285,6 +305,36 @@ def pause(body: PauseReq):
     except Exception:
         pass
     return {"ok": True, "paused": get_paused()}
+
+@app.post("/control/stop", dependencies=[Depends(require_admin)])
+def stop(body: StopReq):
+    """
+    Помечает флаг shutdown=true. Воркер увидит его, выполнит cancel_all+drain по всем парам и завершится.
+    """
+    if not body.confirm:
+        raise HTTPException(status_code=400, detail="Для остановки требуется confirm=true")
+    set_shutdown(True)
+    try:
+        send_event("worker_stop", "Админ запросил полную остановку: воркер завершит цикл, отменит все ордера и выполнит дренаж.")
+    except Exception:
+        pass
+    return {"ok": True, "shutdown": True}
+
+@app.post("/control/start", dependencies=[Depends(require_admin)])
+def start(body: StartReq):
+    """
+    Снимает shutdown и pause. Воркера это не «запускает физически» (Heroku dyno должен быть поднят),
+    но готовит конфигурацию к возобновлению цикла.
+    """
+    if not body.confirm:
+        raise HTTPException(status_code=400, detail="Для запуска требуется confirm=true")
+    set_shutdown(False)
+    set_paused(False)
+    try:
+        send_event("worker_start_requested", "Админ запросил запуск бота (shutdown=false, pause=false)")
+    except Exception:
+        pass
+    return {"ok": True, "shutdown": False, "paused": False}
 
 # ========== Reporting control ==========
 @app.get("/reporting", dependencies=[Depends(require_admin)])
@@ -328,7 +378,6 @@ def get_reporting_summary():
 def admin_ui():
     return HTML_PAGE
 
-# --- HTML/JS: добавлена колонка "ACTIONS" с кнопкой удаления строки ---
 HTML_PAGE = """<!doctype html>
 <html lang="ru"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
 <title>CEX Trading Bot — Admin</title>
@@ -371,9 +420,9 @@ label{font-size:13px;color:#cbd5e1;margin-right:8px}
 <div class="sub">Each pair has its own parameters. The number of rows is unlimited.</div>
 
 <div class="row">
-  <span class="badge"><span id="status-dot" class="status-dot dot-off"></span><span id="paused-label">Status: unknow</span></span>
+  <span class="badge"><span id="status-dot" class="status-dot dot-off"></span><span id="paused-label">Статус: неизвестно</span></span>
   <span class="sep"></span>
-  <button class="ghost" onclick="changeToken()">🔐 Enter/change password</button>
+  <button class="ghost" onclick="changeToken()">🔐 Ввести/сменить пароль</button>
 </div>
 
 <div style="height:12px"></div>
@@ -390,6 +439,8 @@ label{font-size:13px;color:#cbd5e1;margin-right:8px}
   <button class="ghost" onclick="reload()">🔄 Обновить</button>
   <button class="ok" onclick="setPause(false)">▶️ Снять паузу</button>
   <button class="warn" onclick="setPause(true)">⏸ Пауза</button>
+  <button class="danger" onclick="stopBot()">🟥 Полная остановка</button>
+  <button class="primary" onclick="startBot()">🟦 Запустить</button>
 </div>
 
 <div class="section">
@@ -428,10 +479,28 @@ function setToken(t){ localStorage.setItem(TOKEN_KEY, t || ''); }
 function changeToken(){ const t = prompt('Введите пароль администратора'); if (t === null) return; setToken(t.trim()); toast('Пароль сохранён локально'); }
 function authHeaders(){ const t = getToken(); return t ? {'Authorization':'Bearer '+t} : {}; }
 function toast(msg, ok=true){ const t = document.getElementById('toast'); t.textContent = msg; t.style.borderColor = ok ? '#14532d' : '#7f1d1d'; t.style.color = ok ? '#e5e7eb' : '#fecaca'; t.style.display='block'; setTimeout(()=> t.style.display='none', 2200); }
-function setBadge(paused){ const dot=document.getElementById('status-dot'); const label=document.getElementById('paused-label');
-  if (paused===true){ dot.className='status-dot dot-paused'; label.textContent='Статус: на паузе'; }
-  else if (paused===false){ dot.className='status-dot dot-ok'; label.textContent='Статус: работает'; }
-  else { dot.className='status-dot dot-off'; label.textContent='Статус: неизвестно'; }
+
+function setBadge(paused, shutdown, alive){
+  const dot=document.getElementById('status-dot');
+  const label=document.getElementById('paused-label');
+
+  if (!alive){
+    dot.className='status-dot dot-off';
+    label.textContent='Статус: отключён';
+    return;
+  }
+  if (shutdown){
+    dot.className='status-dot dot-off';
+    label.textContent='Статус: остановлен';
+    return;
+  }
+  if (paused===true){
+    dot.className='status-dot dot-paused';
+    label.textContent='Статус: на паузе';
+    return;
+  }
+  dot.className='status-dot dot-ok';
+  label.textContent='Статус: работает';
 }
 
 let EXCHANGES = ['gate'];
@@ -518,7 +587,7 @@ async function reload(){
     const stat = await fetch('/status', { headers: authHeaders() });
     if (stat.ok){
       const js = await stat.json();
-      setBadge(js.paused);
+      setBadge(js.paused, js.shutdown, js.alive);
       if (js.reporting){
         document.getElementById('rep_enabled').value = js.reporting.enabled ? 'true' : 'false';
         document.getElementById('rep_period').value = String(js.reporting.period_min || 60);
@@ -578,7 +647,6 @@ function onDeleteClick(btn){
   const ex  = tr.children[1].querySelector('select').value;
   const p   = tr.children[2].querySelector('input').value.trim().toUpperCase();
   if (!p){
-    // пустую локальную строку — просто удалить из DOM (не отправляя на сервер)
     tr.remove();
     toast('Строка удалена локально. Нажмите «Сохранить пары».');
     return;
@@ -591,28 +659,41 @@ async function setPause(flag){
     const r = await fetch('/control/pause', { method:'POST', headers:Object.assign({"Content-Type":"application/json"}, authHeaders()), body:JSON.stringify({paused:!!flag}) });
     const data = await r.json();
     if (r.status===401){ toast('Неверный пароль (401).', false); return; }
-    setBadge(data.paused); toast(flag ? 'Пауза включена' : 'Пауза снята');
+    setBadge(data.paused, false, true); // мгновенный UI-фидбек
+    toast(flag ? 'Пауза включена' : 'Пауза снята');
+    reload();
   }catch(e){ toast('Ошибка', false); }
 }
 
-async function saveReporting(){
-  const en = document.getElementById('rep_enabled').value === 'true';
-  const pm = parseInt(document.getElementById('rep_period').value || '60', 10);
+async function stopBot(){
+  if (!confirm('Подтвердите полную остановку: будут отменены ВСЕ ордера и выполнен дренаж. Продолжить?')) return;
   try{
-    const r = await fetch('/reporting', { method:'PUT', headers:Object.assign({"Content-Type":"application/json"}, authHeaders()), body: JSON.stringify({enabled: en, period_min: pm}) });
+    const r = await fetch('/control/stop', {
+      method:'POST',
+      headers:Object.assign({"Content-Type":"application/json"}, authHeaders()),
+      body: JSON.stringify({confirm:true})
+    });
     const js = await r.json();
+    if (r.status===401){ toast('Неверный пароль (401).', false); return; }
     if (!r.ok || js.ok===false){ throw new Error(js.detail||JSON.stringify(js)); }
-    toast('Настройки отчётов сохранены');
-  }catch(e){ toast('Не удалось сохранить: '+e.message, false); }
+    toast('Остановка инициирована: воркер завершит работу.');
+    reload();
+  }catch(e){ toast('Не удалось инициировать остановку: '+e.message, false); }
 }
 
-async function sendReportNow(){
+async function startBot(){
   try{
-    const r = await fetch('/reporting/send', { method:'POST', headers: authHeaders() });
+    const r = await fetch('/control/start', {
+      method:'POST',
+      headers:Object.assign({"Content-Type":"application/json"}, authHeaders()),
+      body: JSON.stringify({confirm:true})
+    });
     const js = await r.json();
+    if (r.status===401){ toast('Неверный пароль (401).', false); return; }
     if (!r.ok || js.ok===false){ throw new Error(js.detail||JSON.stringify(js)); }
-    toast('Отчёт отправлен');
-  }catch(e){ toast('Не удалось отправить отчёт: '+e.message, false); }
+    toast('Запуск инициирован (shutdown=false, pause=false).');
+    reload();
+  }catch(e){ toast('Не удалось инициировать запуск: '+e.message, false); }
 }
 
 reload();
