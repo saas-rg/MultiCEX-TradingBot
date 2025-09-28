@@ -1,45 +1,41 @@
-# --- PyCharm/IDEA(IDE) ---
+# --- IDE/venv ---
 .idea/
-*.iml
-.vscode/
-
-# --- Python ---
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
-*.pkl
-*.py[cod]
-*.pyo
-*.pyd
-*.egg-info/
-.venv/
-venv/
-env/
-
-# --- Virtualenv ---
 .venv/
 venv/
 ENV/
 env/
 
-# --- OS junk ---
-.DS_Store
-Thumbs.db
+# --- Secrets & local configs ---
+.env
+.env.*
+*.env
+*.local.json
+*.secret.json
 
 # --- Local DB / logs ---
+.data/
 *.db
 *.sqlite
 *.sqlite3
 logs/
 
-# Secrets & local configs
-.env
-*.local.json
+# --- Project local dirs you don't want in Git ---
+scripts/
 
-# App data & outputs
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+
+# --- OS junk ---
+.DS_Store
+Thumbs.db
+
+# --- App data & outputs ---
 data/
 *.csv
 
-# Node (на будущее)
+# --- Node (на будущее) ---
 node_modules/
